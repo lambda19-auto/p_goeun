@@ -1,0 +1,5 @@
+{
+  "name": "AI Call Quality Auditor",
+  "description": "Automated call center quality assessment using AI agents for transcription, fact extraction, and scoring.",
+  "requestFramePermissions": []
+}
