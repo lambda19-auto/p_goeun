@@ -1,35 +1,23 @@
 import React, { useState, useRef } from 'react';
 import { motion } from 'motion/react';
-import { 
-  Upload, 
-  FileAudio, 
-  FileVideo, 
-  CheckCircle2, 
-  AlertCircle, 
-  Loader2, 
-  BarChart3, 
+import {
+  Upload,
+  FileAudio,
+  FileVideo,
+  CheckCircle2,
+  AlertCircle,
+  Loader2,
+  BarChart3,
   FileText,
   ChevronDown
 } from 'lucide-react';
 import Markdown from 'react-markdown';
 import { cn } from '../lib/utils';
-import { CallScore, FactBlocks, TranscriptionTurn } from '../types';
-
-interface Template {
-  id: string;
-  title: string;
-  weights: {
-    introduction: number;
-    needDiscovery: number;
-    presentation: number;
-    objectionHandling: number;
-    stopWords: number;
-    closing: number;
-  };
-}
+import { CallScore, FactBlocks, Template, TranscriptionTurn } from '../types';
 
 interface AuditorProps {
   templates: Template[];
+  reloadData: () => Promise<void>;
 }
 
 const buildAnalysisTranscript = (turns: TranscriptionTurn[]): string => {
@@ -53,7 +41,25 @@ const buildAnalysisTranscript = (turns: TranscriptionTurn[]): string => {
   ].join('\n\n');
 };
 
-export const Auditor: React.FC<AuditorProps> = ({ templates }) => {
+const estimateDurationFromTurns = (turns: TranscriptionTurn[]) => {
+  const lastTimestamp = turns
+    .map((turn) => turn.timestamp)
+    .filter(Boolean)
+    .at(-1);
+
+  if (!lastTimestamp) {
+    return 0;
+  }
+
+  const match = lastTimestamp.match(/-(\d{2}):(\d{2})\]/);
+  if (!match) {
+    return 0;
+  }
+
+  return Number(match[1]) * 60 + Number(match[2]);
+};
+
+export const Auditor: React.FC<AuditorProps> = ({ templates, reloadData }) => {
   const [file, setFile] = useState<File | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
   const [step, setStep] = useState<'upload' | 'transcribing' | 'extracting' | 'scoring' | 'result'>('upload');
@@ -61,8 +67,9 @@ export const Auditor: React.FC<AuditorProps> = ({ templates }) => {
   const [transcription, setTranscription] = useState<TranscriptionTurn[]>([]);
   const [facts, setFacts] = useState<FactBlocks | null>(null);
   const [scores, setScores] = useState<CallScore | null>(null);
-  const [selectedTemplateId, setSelectedTemplateId] = useState<string>(templates[0]?.id || '');
+  const [selectedTemplateId, setSelectedTemplateId] = useState<string>(String(templates[0]?.id || ''));
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
+  const [savedCallId, setSavedCallId] = useState<number | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -78,18 +85,6 @@ export const Auditor: React.FC<AuditorProps> = ({ templates }) => {
     }
   };
 
-  const fileToBase64 = (file: File): Promise<string> => {
-    return new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.readAsDataURL(file);
-      reader.onload = () => {
-        const base64String = (reader.result as string).split(',')[1];
-        resolve(base64String);
-      };
-      reader.onerror = (error) => reject(error);
-    });
-  };
-
   const safeFetchJSON = async (response: Response, errorMessage: string) => {
     const text = await response.text();
     if (!response.ok) {
@@ -97,15 +92,15 @@ export const Auditor: React.FC<AuditorProps> = ({ templates }) => {
       try {
         const errData = JSON.parse(text);
         parsedError = errData.error || errorMessage;
-      } catch (e) {
+      } catch {
         parsedError = text || errorMessage;
       }
       throw new Error(parsedError);
     }
     try {
       return JSON.parse(text);
-    } catch (e) {
-      console.error("Failed to parse JSON response:", text);
+    } catch {
+      console.error('Failed to parse JSON response:', text);
       throw new Error(`Invalid response format from server: ${text.substring(0, 100)}...`);
     }
   };
@@ -114,9 +109,10 @@ export const Auditor: React.FC<AuditorProps> = ({ templates }) => {
     if (!file) return;
     setIsProcessing(true);
     setError(null);
+    setSavedCallId(null);
     try {
       setStep('transcribing');
-      
+
       const formData = new FormData();
       formData.append('file', file);
 
@@ -144,22 +140,47 @@ export const Auditor: React.FC<AuditorProps> = ({ templates }) => {
       setFacts(factsData);
 
       setStep('scoring');
-      const selectedTemplate = templates.find(t => t.id === selectedTemplateId) || templates[0];
-      const weights = selectedTemplate.weights;
-      
+      const selectedTemplate = templates.find(t => t.id === Number(selectedTemplateId)) || templates[0];
+      if (!selectedTemplate) {
+        throw new Error('Не найден шаблон для оценки.');
+      }
+
       const scoringResponse = await fetch('/api/analyze', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ 
+        body: JSON.stringify({
           transcriptionText: analysisTranscript,
           facts: factsData,
-          weights,
-          factsOnly: false 
+          weights: selectedTemplate.weights,
+          factsOnly: false
         }),
       });
 
       const scoresData = await safeFetchJSON(scoringResponse, 'Scoring failed');
       setScores(scoresData);
+
+      const saveResponse = await fetch('/api/calls', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          templateId: selectedTemplate.id,
+          audioFileName: file.name,
+          audioMimeType: file.type,
+          audioSizeBytes: file.size,
+          durationSeconds: estimateDurationFromTurns(transcriptionData),
+          transcriptText: analysisTranscript,
+          transcriptJson: transcriptionData,
+          averageScore: scoresData.average,
+          summary: factsData.summary,
+          feedbackText: scoresData.feedback,
+          factsJson: factsData,
+          scoresJson: scoresData,
+        }),
+      });
+
+      const savedCall = await safeFetchJSON(saveResponse, 'Saving call failed');
+      setSavedCallId(savedCall.callId || null);
+      await reloadData();
       setStep('result');
     } catch (err: any) {
       console.error(err);
@@ -177,6 +198,7 @@ export const Auditor: React.FC<AuditorProps> = ({ templates }) => {
     setTranscription([]);
     setFacts(null);
     setScores(null);
+    setSavedCallId(null);
     setStep('upload');
     setError(null);
   };
@@ -185,7 +207,8 @@ export const Auditor: React.FC<AuditorProps> = ({ templates }) => {
     const reportData = {
       score: scores,
       facts: facts,
-      transcription: transcription
+      transcription: transcription,
+      savedCallId,
     };
     const blob = new Blob([JSON.stringify(reportData, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
@@ -212,7 +235,7 @@ export const Auditor: React.FC<AuditorProps> = ({ templates }) => {
                 <Upload size={40} />
               </div>
               <h2 className="text-2xl font-bold text-zinc-100 mb-2">Аудит нового звонка</h2>
-              <p className="text-zinc-400 mb-8">Загрузите запись для мгновенного анализа AI-агентами</p>
+              <p className="text-zinc-400 mb-8">Результат анализа сохраняется в SQLite вместе с шаблоном, транскрипцией и итоговой оценкой.</p>
 
               {file && (
                 <div className="bg-indigo-950/20 border border-indigo-900/30 rounded-xl p-4 flex items-center gap-4 mb-8 max-w-md mx-auto">
@@ -225,14 +248,14 @@ export const Auditor: React.FC<AuditorProps> = ({ templates }) => {
                 </div>
               )}
               {error && <div className="flex items-center gap-2 text-red-400 justify-center mb-6"><AlertCircle size={18} /><span className="text-sm font-medium">{error}</span></div>}
-              <button onClick={(e) => { e.stopPropagation(); if (file) processCall(); else fileInputRef.current?.click(); }} className={cn("px-8 py-4 rounded-2xl font-bold text-lg transition-all shadow-xl", file ? "bg-indigo-600 text-white hover:bg-indigo-700 shadow-indigo-900/20" : "bg-zinc-800 text-zinc-500 cursor-not-allowed")}>
+              <button onClick={(e) => { e.stopPropagation(); if (file) void processCall(); else fileInputRef.current?.click(); }} className={cn('px-8 py-4 rounded-2xl font-bold text-lg transition-all shadow-xl', file ? 'bg-indigo-600 text-white hover:bg-indigo-700 shadow-indigo-900/20' : 'bg-zinc-800 text-zinc-500 cursor-not-allowed')}>
                 {file ? 'Начать анализ' : 'Выбрать файл'}
               </button>
 
               <div className="max-w-xs mx-auto mt-10 text-left relative z-20">
                 <label className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest mb-2 block">Шаблон оценки</label>
                 <div className="relative group/select">
-                  <select 
+                  <select
                     value={selectedTemplateId}
                     onChange={(e) => setSelectedTemplateId(e.target.value)}
                     onClick={(e) => e.stopPropagation()}
@@ -259,13 +282,13 @@ export const Auditor: React.FC<AuditorProps> = ({ templates }) => {
         <div className="flex flex-col items-center justify-center min-h-[70vh] text-center">
           <div className="relative w-32 h-32 mb-8">
             <div className="absolute inset-0 border-4 border-zinc-800 rounded-full"></div>
-            <motion.div className="absolute inset-0 border-4 border-indigo-500 rounded-full border-t-transparent" animate={{ rotate: 360 }} transition={{ duration: 1, repeat: Infinity, ease: "linear" }}></motion.div>
+            <motion.div className="absolute inset-0 border-4 border-indigo-500 rounded-full border-t-transparent" animate={{ rotate: 360 }} transition={{ duration: 1, repeat: Infinity, ease: 'linear' }}></motion.div>
             <div className="absolute inset-0 flex items-center justify-center"><Loader2 className="text-indigo-400 animate-pulse" size={40} /></div>
           </div>
           <h2 className="text-2xl font-bold text-zinc-100 mb-4">
-            {step === 'transcribing' && "Транскрибируем звонок..."}
-            {step === 'extracting' && "Выделяем ключевые факты..."}
-            {step === 'scoring' && "Оцениваем качество..."}
+            {step === 'transcribing' && 'Транскрибируем звонок...'}
+            {step === 'extracting' && 'Выделяем ключевые факты...'}
+            {step === 'scoring' && 'Оцениваем качество...'}
           </h2>
         </div>
       )}
@@ -280,6 +303,7 @@ export const Auditor: React.FC<AuditorProps> = ({ templates }) => {
               <div>
                 <h2 className="text-xl font-bold text-zinc-100">{file?.name}</h2>
                 <p className="text-sm text-zinc-500">{((file?.size || 0) / (1024 * 1024)).toFixed(2)} MB • {new Date().toLocaleDateString()}</p>
+                {savedCallId && <p className="text-xs text-emerald-400 mt-1">Сохранено в SQLite как звонок #{savedCallId}</p>}
               </div>
             </div>
             <div className="flex items-center gap-3">
@@ -318,34 +342,24 @@ export const Auditor: React.FC<AuditorProps> = ({ templates }) => {
               <div className="bg-zinc-900 rounded-3xl p-8 border border-zinc-800 shadow-xl">
                 <h3 className="font-black text-xs uppercase tracking-[0.2em] text-zinc-500 mb-8 flex items-center gap-3">
                   <BarChart3 size={16} className="text-indigo-400" />
-                  Detailed Metrics
+                  Оценка по блокам
                 </h3>
-                <div className="space-y-6">
-                  {[
-                    { label: 'Вступление', score: scores?.introduction },
-                    { label: 'Потребности', score: scores?.needDiscovery },
-                    { label: 'Презентация', score: scores?.presentation },
-                    { label: 'Возражения', score: scores?.objectionHandling },
-                    { label: 'Стоп-слова', score: scores?.stopWords },
-                    { label: 'Завершение', score: scores?.closing },
-                  ].map((item, i) => (
-                    <div key={i} className="group">
-                      <div className="flex justify-between text-xs mb-3">
-                        <span className="font-bold text-zinc-400 group-hover:text-zinc-200 transition-colors uppercase tracking-wider">{item.label}</span>
-                        <span className="font-black text-zinc-100">{item.score}/10</span>
+                <div className="space-y-5">
+                  {scores && [
+                    { label: 'Вступление', value: scores.introduction },
+                    { label: 'Потребности', value: scores.needDiscovery },
+                    { label: 'Презентация', value: scores.presentation },
+                    { label: 'Возражения', value: scores.objectionHandling },
+                    { label: 'Стоп-слова', value: scores.stopWords },
+                    { label: 'Завершение', value: scores.closing },
+                  ].map((item) => (
+                    <div key={item.label}>
+                      <div className="flex justify-between mb-2">
+                        <span className="text-sm font-semibold text-zinc-300">{item.label}</span>
+                        <span className="text-sm font-bold text-zinc-100">{item.value}/10</span>
                       </div>
-                      <div className="h-1.5 bg-zinc-800 rounded-full overflow-hidden">
-                        <motion.div 
-                          initial={{ width: 0 }} 
-                          animate={{ width: `${(item.score || 0) * 10}%` }} 
-                          transition={{ duration: 1, delay: i * 0.1 }}
-                          className={cn(
-                            "h-full rounded-full transition-all duration-500", 
-                            (item.score || 0) >= 8 ? "bg-emerald-500 shadow-[0_0_10_rgba(16,185,129,0.3)]" : 
-                            (item.score || 0) >= 5 ? "bg-amber-500 shadow-[0_0_10_rgba(245,158,11,0.3)]" : 
-                            "bg-red-500 shadow-[0_0_10_rgba(239,68,68,0.3)]"
-                          )} 
-                        />
+                      <div className="w-full bg-zinc-800 rounded-full h-2">
+                        <div className="bg-indigo-500 h-2 rounded-full" style={{ width: `${item.value * 10}%` }}></div>
                       </div>
                     </div>
                   ))}
@@ -354,75 +368,41 @@ export const Auditor: React.FC<AuditorProps> = ({ templates }) => {
             </div>
 
             <div className="lg:col-span-8 space-y-8">
-              <div className="bg-zinc-900 rounded-3xl border border-zinc-800 shadow-2xl overflow-hidden flex flex-col h-[700px]">
-                <div className="border-b border-zinc-800 bg-zinc-950/50 px-8 py-5 space-y-3">
-                  <h3 className="text-xs font-black uppercase tracking-widest text-indigo-400">
-                    Full Transcription
-                  </h3>
-                  {transcription.some((turn) => turn.speakerReliable === false) && (
-                    <p className="text-xs leading-relaxed text-amber-300">
-                      Для длинных записей транскрипция разбивается на фрагменты, поэтому метки спикеров
-                      помогают различать собеседников только внутри каждого фрагмента. При оценке они
-                      сохраняются в анализе, но не считаются глобально стабильными между фрагментами.
-                    </p>
-                  )}
-                </div>
-                <div className="flex-1 overflow-y-auto p-8 space-y-8 scrollbar-thin scrollbar-thumb-zinc-800 hover:scrollbar-thumb-zinc-700 transition-colors">
-                  {transcription.map((turn, i) => (
-                    <motion.div 
-                      key={i} 
-                      initial={{ opacity: 0, y: 10 }}
-                      animate={{ opacity: 1, y: 0 }}
-                      transition={{ delay: i * 0.05 }}
-                      className="flex flex-col gap-2 max-w-[85%] items-start"
-                    >
-                      <div className="flex items-center gap-3 mb-1">
-                        <span className="text-[10px] font-black uppercase tracking-[0.2em] text-zinc-500">
-                          {turn.speaker}
-                        </span>
-                        {turn.timestamp && (
-                          <span className="text-[9px] font-mono text-zinc-600 bg-zinc-950 px-2 py-0.5 rounded border border-zinc-800">
-                            {turn.timestamp}
-                          </span>
-                        )}
-                      </div>
-                      <div className="px-5 py-4 rounded-2xl text-sm leading-relaxed shadow-lg bg-zinc-800 text-zinc-200 border border-zinc-700/50">
-                        {turn.text}
-                      </div>
-                    </motion.div>
+              <div className="bg-zinc-900 rounded-3xl p-8 border border-zinc-800 shadow-xl">
+                <h3 className="font-black text-xs uppercase tracking-[0.2em] text-zinc-500 mb-6">Факты и summary</h3>
+                <div className="grid md:grid-cols-2 gap-4">
+                  {facts && [
+                    { label: 'Вступление', text: facts.introduction },
+                    { label: 'Потребности', text: facts.needDiscovery },
+                    { label: 'Презентация', text: facts.presentation },
+                    { label: 'Возражения', text: facts.objectionHandling },
+                    { label: 'Стоп-слова', text: facts.stopWords },
+                    { label: 'Завершение', text: facts.closing },
+                    { label: 'Summary', text: facts.summary, fullWidth: true },
+                  ].map((item) => (
+                    <div key={item.label} className={cn('rounded-2xl bg-zinc-950 border border-zinc-800 p-4', item.fullWidth && 'md:col-span-2')}>
+                      <p className="text-[10px] font-black uppercase tracking-[0.2em] text-indigo-400 mb-2">{item.label}</p>
+                      <p className="text-sm text-zinc-300 leading-relaxed whitespace-pre-wrap">{item.text || 'Нет данных'}</p>
+                    </div>
                   ))}
                 </div>
               </div>
 
-              <div className="space-y-6">
-                {[
-                  { title: 'Вступление', content: facts?.introduction, icon: CheckCircle2 },
-                  { title: 'Потребности', content: facts?.needDiscovery, icon: BarChart3 },
-                  { title: 'Презентация', content: facts?.presentation, icon: FileText },
-                  { title: 'Возражения', content: facts?.objectionHandling, icon: AlertCircle },
-                  { title: 'Стоп-слова', content: facts?.stopWords, icon: AlertCircle },
-                  { title: 'Завершение', content: facts?.closing, icon: CheckCircle2 },
-                ].map((block, i) => (
-                  <motion.div 
-                    key={i} 
-                    initial={{ opacity: 0, y: 20 }}
-                    animate={{ opacity: 1, y: 0 }}
-                    transition={{ delay: 0.5 + i * 0.1 }}
-                    className="bg-zinc-900 p-8 rounded-3xl border border-zinc-800 shadow-xl hover:border-indigo-500/30 transition-colors group"
-                  >
-                    <div className="flex items-center gap-3 mb-4">
-                      <div className="w-8 h-8 rounded-lg bg-indigo-950/30 flex items-center justify-center text-indigo-400 group-hover:scale-110 transition-transform">
-                        <block.icon size={16} />
+              <div className="bg-zinc-900 rounded-3xl p-8 border border-zinc-800 shadow-xl">
+                <h3 className="font-black text-xs uppercase tracking-[0.2em] text-zinc-500 mb-6">Транскрипция</h3>
+                <div className="space-y-4 max-h-[32rem] overflow-y-auto pr-2">
+                  {transcription.map((turn, index) => (
+                    <div key={`${turn.speaker}-${index}`} className="bg-zinc-950 border border-zinc-800 rounded-2xl p-4">
+                      <div className="flex items-center gap-3 mb-2 text-xs text-zinc-500 uppercase tracking-widest font-bold">
+                        <span>{turn.speaker}</span>
+                        {turn.timestamp && <span>{turn.timestamp}</span>}
                       </div>
-                      <h4 className="text-[10px] font-black uppercase tracking-[0.2em] text-zinc-500 group-hover:text-indigo-400 transition-colors">
-                        {block.title}
-                      </h4>
+                      <div className="text-sm text-zinc-300 leading-relaxed prose prose-invert max-w-none">
+                        <Markdown>{turn.text}</Markdown>
+                      </div>
                     </div>
-                    <p className="text-sm text-zinc-400 leading-relaxed group-hover:text-zinc-300 transition-colors">
-                      {typeof block.content === 'string' ? block.content : JSON.stringify(block.content || '')}
-                    </p>
-                  </motion.div>
-                ))}
+                  ))}
+                </div>
               </div>
             </div>
           </div>

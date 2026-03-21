@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { BrowserRouter as Router, Routes, Route } from 'react-router-dom';
 import { AnimatePresence } from 'motion/react';
 import { Sidebar } from './components/Sidebar';
@@ -6,61 +6,76 @@ import { Dashboard } from './pages/Dashboard';
 import { Auditor } from './pages/Auditor';
 import { Templates } from './pages/Templates';
 import { Profile } from './pages/Profile';
+import { DashboardData, ProfileData, Template } from './types';
 
-interface Template {
-  id: string;
-  title: string;
-  desc: string;
-  weights: {
-    introduction: number;
-    needDiscovery: number;
-    presentation: number;
-    objectionHandling: number;
-    stopWords: number;
-    closing: number;
-  };
-  active: boolean;
-}
+const emptyDashboard: DashboardData = {
+  totalCalls: 0,
+  averageScore: 0,
+  totalDurationSeconds: 0,
+  activeTemplates: 0,
+  leaderboard: [],
+};
 
 export default function App() {
-  // Templates State
-  const [templates, setTemplates] = useState<Template[]>([
-    { 
-      id: '1', 
-      title: 'Холодные продажи', 
-      desc: 'Фокус на обходе секретаря и выявлении ЛПР.', 
-      weights: { introduction: 20, needDiscovery: 20, presentation: 20, objectionHandling: 20, stopWords: 10, closing: 10 },
-      active: true 
-    },
-    { 
-      id: '2', 
-      title: 'Техподдержка', 
-      desc: 'Оценка эмпатии и скорости решения проблемы.', 
-      weights: { introduction: 10, needDiscovery: 30, presentation: 10, objectionHandling: 10, stopWords: 10, closing: 30 },
-      active: true 
-    },
-    { 
-      id: '3', 
-      title: 'Удержание клиентов', 
-      desc: 'Анализ работы с оттоком и спецпредложениями.', 
-      weights: { introduction: 15, needDiscovery: 15, presentation: 20, objectionHandling: 20, stopWords: 10, closing: 20 },
-      active: false 
-    },
-  ]);
+  const [templates, setTemplates] = useState<Template[]>([]);
+  const [profile, setProfile] = useState<ProfileData | null>(null);
+  const [dashboard, setDashboard] = useState<DashboardData>(emptyDashboard);
+  const [isLoading, setIsLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  const loadBootstrap = async () => {
+    setIsLoading(true);
+    setError(null);
+    try {
+      const response = await fetch('/api/bootstrap');
+      if (!response.ok) {
+        throw new Error('Не удалось загрузить данные приложения.');
+      }
+
+      const data = await response.json();
+      setTemplates(data.templates ?? []);
+      setProfile(data.profile ?? null);
+      setDashboard(data.dashboard ?? emptyDashboard);
+    } catch (err: any) {
+      setError(err.message || 'Не удалось загрузить данные приложения.');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    void loadBootstrap();
+  }, []);
+
+  const sharedProps = useMemo(() => ({ templates, reloadData: loadBootstrap }), [templates]);
+
+  if (isLoading) {
+    return <div className="min-h-screen bg-zinc-950 text-zinc-100 flex items-center justify-center">Загрузка данных…</div>;
+  }
+
+  if (error) {
+    return (
+      <div className="min-h-screen bg-zinc-950 text-zinc-100 flex flex-col items-center justify-center gap-4 px-6 text-center">
+        <p className="text-lg font-semibold">{error}</p>
+        <button onClick={() => void loadBootstrap()} className="px-5 py-3 rounded-xl bg-indigo-600 hover:bg-indigo-700 font-bold transition-colors">
+          Повторить
+        </button>
+      </div>
+    );
+  }
 
   return (
     <Router>
       <div className="flex h-screen bg-zinc-950 text-zinc-100 overflow-hidden">
         <Sidebar />
 
-        {/* Main Content */}
         <main className="flex-1 overflow-y-auto relative">
           <AnimatePresence mode="wait">
             <Routes>
-              <Route path="/" element={<Dashboard templates={templates} />} />
-              <Route path="/auditor" element={<Auditor templates={templates} />} />
-              <Route path="/templates" element={<Templates templates={templates} setTemplates={setTemplates} />} />
-              <Route path="/profile" element={<Profile />} />
+              <Route path="/" element={<Dashboard templates={templates} initialDashboard={dashboard} reloadData={loadBootstrap} />} />
+              <Route path="/auditor" element={<Auditor {...sharedProps} />} />
+              <Route path="/templates" element={<Templates templates={templates} setTemplates={setTemplates} reloadData={loadBootstrap} />} />
+              <Route path="/profile" element={<Profile profile={profile} />} />
             </Routes>
           </AnimatePresence>
         </main>

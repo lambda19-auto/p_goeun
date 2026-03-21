@@ -11,6 +11,7 @@ import ffmpegStatic from "ffmpeg-static";
 import fs from "fs";
 import os from "os";
 import { v4 as uuidv4 } from "uuid";
+import { createTemplate, getDashboardStats, getDefaultUserId, getProfile, initializeDatabase, listTemplates, saveCallAnalysis, type TemplateWeightMap } from "./db";
 
 dotenv.config();
 
@@ -211,6 +212,29 @@ async function splitAudioForTranscription(filePath: string, tempId: string): Pro
 }
 
 // Helper to safely parse LLM JSON responses
+function normalizeTemplateWeights(input: Partial<Record<keyof TemplateWeightMap, unknown>>): TemplateWeightMap {
+  const normalized = {
+    introduction: Number(input.introduction ?? 0),
+    needDiscovery: Number(input.needDiscovery ?? 0),
+    presentation: Number(input.presentation ?? 0),
+    objectionHandling: Number(input.objectionHandling ?? 0),
+    stopWords: Number(input.stopWords ?? 0),
+    closing: Number(input.closing ?? 0),
+  } satisfies TemplateWeightMap;
+
+  const values = Object.values(normalized);
+  if (values.some((value) => !Number.isFinite(value) || value < 0)) {
+    throw new Error("Template weights must be non-negative numbers.");
+  }
+
+  const total = values.reduce((sum, value) => sum + value, 0);
+  if (Math.round(total) !== 100) {
+    throw new Error("Template weights must sum to 100.");
+  }
+
+  return normalized;
+}
+
 function safeParseJSON(content: string | null | undefined): any {
   if (!content) return {};
   const str = String(content);
@@ -234,11 +258,102 @@ function safeParseJSON(content: string | null | undefined): any {
 }
 
 async function startServer() {
+  initializeDatabase();
+
   app.use(express.json());
 
   // Health check
   app.get("/api/health", (req, res) => {
     res.json({ status: "ok" });
+  });
+
+  app.get("/api/bootstrap", (req, res) => {
+    try {
+      const userId = getDefaultUserId();
+      const templateId = typeof req.query.templateId === "string" ? Number(req.query.templateId) : undefined;
+      res.json({
+        templates: listTemplates(),
+        profile: getProfile(userId),
+        dashboard: getDashboardStats(Number.isFinite(templateId) ? templateId : undefined),
+      });
+    } catch (error: any) {
+      console.error("Bootstrap error:", error);
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  app.get("/api/templates", (req, res) => {
+    try {
+      res.json(listTemplates());
+    } catch (error: any) {
+      console.error("Templates list error:", error);
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  app.post("/api/templates", (req, res) => {
+    try {
+      const { title, description, isActive, weights } = req.body ?? {};
+      if (!title || typeof title !== "string") {
+        return res.status(400).json({ error: "Template title is required." });
+      }
+
+      const template = createTemplate({
+        title,
+        description: typeof description === "string" ? description : undefined,
+        isActive: typeof isActive === "boolean" ? isActive : true,
+        createdByUserId: getDefaultUserId(),
+        weights: normalizeTemplateWeights(weights ?? {}),
+      });
+
+      res.status(201).json(template);
+    } catch (error: any) {
+      console.error("Template create error:", error);
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  app.post("/api/calls", (req, res) => {
+    try {
+      const {
+        templateId,
+        audioFileName,
+        audioMimeType,
+        audioSizeBytes,
+        durationSeconds,
+        transcriptText,
+        transcriptJson,
+        averageScore,
+        summary,
+        feedbackText,
+        factsJson,
+        scoresJson,
+      } = req.body ?? {};
+
+      if (!templateId || !audioFileName || !transcriptText || typeof averageScore !== "number") {
+        return res.status(400).json({ error: "Missing required call analysis fields." });
+      }
+
+      const result = saveCallAnalysis({
+        templateId: Number(templateId),
+        audioFileName,
+        audioMimeType,
+        audioSizeBytes: typeof audioSizeBytes === "number" ? audioSizeBytes : undefined,
+        durationSeconds: typeof durationSeconds === "number" ? durationSeconds : undefined,
+        transcriptText,
+        transcriptJson,
+        averageScore,
+        summary,
+        feedbackText,
+        factsJson,
+        scoresJson,
+      });
+
+      res.status(201).json(result);
+    } catch (error: any) {
+      console.error("Call save error:", error);
+      res.status(500).json({ error: error.message });
+    }
   });
 
   // API Route for Transcription
