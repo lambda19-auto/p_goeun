@@ -28,8 +28,6 @@ const upload = multer({ storage: multer.memoryStorage() });
 const ANALYSIS_MODEL = "gpt-5.1-2025-11-13";
 const OPENAI_TRANSCRIPTION_MODEL = "gpt-4o-transcribe-diarize";
 const MAX_TRANSCRIPTION_FILE_BYTES = 25 * 1024 * 1024;
-const TARGET_TRANSCRIPTION_CHUNK_BYTES = 24 * 1024 * 1024;
-const MAX_TRANSCRIPTION_CHUNKS = 16;
 
 // Initialize OpenAI lazily to ensure environment variables are loaded
 let openAIInstance: OpenAI | null = null;
@@ -151,52 +149,65 @@ async function transcribeDiarizedFile(
     : [];
 }
 
-async function splitAudioForTranscription(filePath: string, tempId: string) {
-  const fileSize = fs.statSync(filePath).size;
-  if (fileSize <= MAX_TRANSCRIPTION_FILE_BYTES) {
-    return [{ path: filePath, offsetSeconds: 0, cleanup: false }];
-  }
+type TranscriptionFile = {
+  path: string;
+  offsetSeconds: number;
+};
 
-  const durationSeconds = await getAudioDurationInSeconds(filePath);
-  const chunkCount = Math.ceil(fileSize / TARGET_TRANSCRIPTION_CHUNK_BYTES);
+type SplitAudioResult = {
+  files: TranscriptionFile[];
+  cleanupDirs: string[];
+};
 
-  if (chunkCount > MAX_TRANSCRIPTION_CHUNKS) {
-    throw new Error(
-      `Converted audio is ${Math.ceil(fileSize / (1024 * 1024))} MB and would require ${chunkCount} transcription chunks. Please upload a shorter recording.`,
-    );
-  }
-
-  const chunkDurationSeconds = Math.max(1, Math.ceil(durationSeconds / chunkCount));
-  const chunkDir = fs.mkdtempSync(path.join(os.tmpdir(), `${tempId}_chunks_`));
-  const chunks: Array<{ path: string; offsetSeconds: number; cleanup: boolean }> = [];
-
-  for (let index = 0; index < chunkCount; index += 1) {
-    const offsetSeconds = index * chunkDurationSeconds;
-    const remainingSeconds = durationSeconds - offsetSeconds;
-    if (remainingSeconds <= 0) {
-      break;
+async function splitAudioForTranscription(filePath: string, tempId: string): Promise<SplitAudioResult> {
+  const createChunks = async (
+    sourcePath: string,
+    sourceOffsetSeconds: number,
+    depth: number,
+  ): Promise<SplitAudioResult> => {
+    const fileSize = fs.statSync(sourcePath).size;
+    if (fileSize <= MAX_TRANSCRIPTION_FILE_BYTES) {
+      return { files: [{ path: sourcePath, offsetSeconds: sourceOffsetSeconds }], cleanupDirs: [] };
     }
 
-    const chunkPath = path.join(chunkDir, `chunk_${index}.mp3`);
-    await runFfmpeg(
-      ffmpeg(filePath)
-        .setStartTime(offsetSeconds)
-        .duration(Math.min(chunkDurationSeconds, remainingSeconds))
-        .outputOptions("-c copy"),
-      chunkPath,
-    );
-
-    const chunkSize = fs.statSync(chunkPath).size;
-    if (chunkSize > MAX_TRANSCRIPTION_FILE_BYTES) {
+    const durationSeconds = await getAudioDurationInSeconds(sourcePath);
+    if (durationSeconds <= 1 || depth >= 32) {
       throw new Error(
-        `A transcription chunk is still ${Math.ceil(chunkSize / (1024 * 1024))} MB after splitting. Please upload a shorter recording.`,
+        `Audio chunk is ${Math.ceil(fileSize / (1024 * 1024))} MB and could not be reduced below the ${Math.ceil(MAX_TRANSCRIPTION_FILE_BYTES / (1024 * 1024))} MB transcription limit.`,
       );
     }
 
-    chunks.push({ path: chunkPath, offsetSeconds, cleanup: true });
-  }
+    const chunkCount = Math.max(2, Math.ceil(fileSize / MAX_TRANSCRIPTION_FILE_BYTES));
+    const chunkDurationSeconds = Math.max(1, Math.ceil(durationSeconds / chunkCount));
+    const chunkDir = fs.mkdtempSync(path.join(os.tmpdir(), `${tempId}_chunks_`));
+    const files: TranscriptionFile[] = [];
+    const cleanupDirs = [chunkDir];
 
-  return chunks;
+    for (let index = 0; index < chunkCount; index += 1) {
+      const offsetSeconds = index * chunkDurationSeconds;
+      const remainingSeconds = durationSeconds - offsetSeconds;
+      if (remainingSeconds <= 0) {
+        break;
+      }
+
+      const chunkPath = path.join(chunkDir, `chunk_${depth}_${index}.mp3`);
+      await runFfmpeg(
+        ffmpeg(sourcePath)
+          .setStartTime(offsetSeconds)
+          .duration(Math.min(chunkDurationSeconds, remainingSeconds))
+          .outputOptions("-c copy"),
+        chunkPath,
+      );
+
+      const nestedResult = await createChunks(chunkPath, sourceOffsetSeconds + offsetSeconds, depth + 1);
+      files.push(...nestedResult.files);
+      cleanupDirs.push(...nestedResult.cleanupDirs);
+    }
+
+    return { files, cleanupDirs };
+  };
+
+  return createChunks(filePath, 0, 0);
 }
 
 // Helper to safely parse LLM JSON responses
@@ -234,7 +245,6 @@ async function startServer() {
   app.post("/api/transcribe", upload.single("file"), async (req, res) => {
     let inputPath = "";
     let outputPath = "";
-    const cleanupPaths: string[] = [];
     const cleanupDirs: string[] = [];
     try {
       if (!req.file) {
@@ -254,13 +264,8 @@ async function startServer() {
       console.log(`Converting ${originalMimetype} to mp3...`);
       await runFfmpeg(ffmpeg(inputPath).toFormat("mp3"), outputPath);
 
-      const transcriptionFiles = await splitAudioForTranscription(outputPath, tempId);
-      for (const transcriptionFile of transcriptionFiles) {
-        if (transcriptionFile.cleanup) {
-          cleanupPaths.push(transcriptionFile.path);
-          cleanupDirs.push(path.dirname(transcriptionFile.path));
-        }
-      }
+      const { files: transcriptionFiles, cleanupDirs: chunkCleanupDirs } = await splitAudioForTranscription(outputPath, tempId);
+      cleanupDirs.push(...chunkCleanupDirs);
 
       // Transcription using OpenAI diarized transcription
       console.log(`Transcribing using ${OPENAI_TRANSCRIPTION_MODEL} (Russian)...`);
@@ -279,15 +284,12 @@ async function startServer() {
     } catch (error: any) {
       console.error("Transcription error:", error);
       const statusCode =
-        typeof error?.message === "string" && error.message.includes("Please upload a shorter recording")
+        typeof error?.message === "string" && error.message.includes("transcription limit")
           ? 413
           : 500;
       res.status(statusCode).json({ error: error.message });
     } finally {
       // Cleanup temp files
-      for (const cleanupPath of cleanupPaths) {
-        if (fs.existsSync(cleanupPath)) fs.unlinkSync(cleanupPath);
-      }
       for (const cleanupDir of new Set(cleanupDirs)) {
         if (fs.existsSync(cleanupDir)) fs.rmSync(cleanupDir, { recursive: true, force: true });
       }
