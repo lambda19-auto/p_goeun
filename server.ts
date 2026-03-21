@@ -299,7 +299,7 @@ async function startServer() {
   // API Route for Fact Extraction & Scoring
   app.post("/api/analyze", async (req, res) => {
     try {
-      const { transcriptionText, weights, factsOnly } = req.body;
+      const { transcriptionText, facts, weights, factsOnly } = req.body;
 
       if (factsOnly) {
         const facts = await generateJsonResponse(`На основе следующей транскрипции звонка выдели ключевые факты по блокам и составь общую сводку. Верни результат СТРОГО в формате JSON со следующими ключами.
@@ -319,15 +319,18 @@ ${transcriptionText}`);
         return res.json(facts);
       }
 
-      const scoring = await generateJsonResponse(`Оцени качество звонка на основе выделенных фактов и верни результат СТРОГО в формате JSON. Поставь оценку от 1 до 10 для каждого блока.
+      const scoring = await generateJsonResponse(`Оцени качество звонка на основе полной транскрипции и выделенных фактов, затем верни результат СТРОГО в формате JSON. Поставь оценку от 1 до 10 для каждого блока.
 
-ВАЖНО: При расчете среднего балла используй следующие веса (в процентах):
-- Вступление: ${weights.introduction}%
-- Потребности: ${weights.needDiscovery}%
-- Презентация: ${weights.presentation}%
-- Возражения: ${weights.objectionHandling}%
-- Стоп-слова: ${weights.stopWords}%
-- Завершение: ${weights.closing}%
+ВАЖНО:
+- Используй полную транскрипцию как основной источник контекста, включая префиксы speaker: и предупреждение о chunk-local метках спикеров, если они присутствуют.
+- Используй блок "Выделенные факты" как вспомогательную сводку, но не теряй speaker attribution, если в фактах оно сокращено.
+- При расчете среднего балла используй следующие веса (в процентах):
+  - Вступление: ${weights.introduction}%
+  - Потребности: ${weights.needDiscovery}%
+  - Презентация: ${weights.presentation}%
+  - Возражения: ${weights.objectionHandling}%
+  - Стоп-слова: ${weights.stopWords}%
+  - Завершение: ${weights.closing}%
 
 Итоговый средний балл должен быть взвешенным на основе этих процентов. Также добавь краткий фидбек.
 
@@ -341,8 +344,11 @@ ${transcriptionText}`);
 - average (number)
 - feedback (string)
 
-Факты:
-${transcriptionText}`);
+Полная транскрипция:
+${transcriptionText}
+
+Выделенные факты:
+${JSON.stringify(facts ?? {})}`);
 
       res.json(scoring);
     } catch (error: any) {
