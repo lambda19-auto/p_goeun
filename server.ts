@@ -2,7 +2,8 @@ import express from "express";
 import { createServer as createViteServer } from "vite";
 import path from "path";
 import multer from "multer";
-import { GoogleGenAI } from "@google/genai";
+import OpenAI from "openai";
+import type { TranscriptionDiarized } from "openai/resources/audio/transcriptions";
 import dotenv from "dotenv";
 import ffmpeg from "fluent-ffmpeg";
 import ffmpegStatic from "ffmpeg-static";
@@ -21,18 +22,40 @@ const PORT = 3000;
 
 const upload = multer({ storage: multer.memoryStorage() });
 
-// Initialize Gemini lazily to ensure environment variables are loaded
-let genAIInstance: GoogleGenAI | null = null;
+const ANALYSIS_MODEL = "gpt-5.1-2025-11-13";
 
-function getGenAI() {
-  if (!genAIInstance) {
-    const apiKey = process.env.GEMINI_API_KEY || process.env.API_KEY;
+// Initialize OpenAI lazily to ensure environment variables are loaded
+let openAIInstance: OpenAI | null = null;
+
+function getOpenAI() {
+  if (!openAIInstance) {
+    const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) {
-      throw new Error("GEMINI_API_KEY environment variable is missing. Please add it to Secrets.");
+      throw new Error("OPENAI_API_KEY environment variable is missing. Please add it to Secrets.");
     }
-    genAIInstance = new GoogleGenAI({ apiKey });
+    openAIInstance = new OpenAI({ apiKey });
   }
-  return genAIInstance;
+  return openAIInstance;
+}
+
+async function generateJsonResponse(input: string) {
+  const response = await getOpenAI().responses.create({
+    model: ANALYSIS_MODEL,
+    input,
+    text: {
+      format: { type: "json_object" },
+      verbosity: "medium",
+    },
+  });
+
+  return safeParseJSON(response.output_text);
+}
+
+function formatTimestamp(seconds: number): string {
+  const totalSeconds = Math.max(0, Math.floor(seconds));
+  const minutes = String(Math.floor(totalSeconds / 60)).padStart(2, "0");
+  const remainingSeconds = String(totalSeconds % 60).padStart(2, "0");
+  return `${minutes}:${remainingSeconds}`;
 }
 
 // Helper to safely parse LLM JSON responses
@@ -94,39 +117,25 @@ async function startServer() {
           .save(outputPath);
       });
 
-      const audioBase64 = fs.readFileSync(outputPath, { encoding: "base64" });
+      // Transcription using OpenAI diarized transcription
+      console.log(`Transcribing using gpt-4o-transcribe-diarize (Russian)...`);
+      const result = (await getOpenAI().audio.transcriptions.create({
+        file: fs.createReadStream(outputPath),
+        model: "gpt-4o-transcribe-diarize",
+        language: "ru",
+        response_format: "diarized_json",
+        chunking_strategy: "auto",
+      })) as TranscriptionDiarized;
 
-      // Transcription using Gemini 1.5 Flash
-      console.log(`Transcribing using gemini-1.5-flash (Russian)...`);
-      const result = await getGenAI().models.generateContent({
-        model: "gemini-1.5-flash",
-        contents: [
-          {
-            parts: [
-              {
-                inlineData: {
-                  mimeType: "audio/mp3",
-                  data: audioBase64,
-                },
-              },
-              {
-                text: `Транскрибируй этот аудиофайл на русском языке. 
-          Используй диаризацию (разделение по спикерам). 
-          Верни результат СТРОГО в формате JSON как массив объектов.
-          Каждый объект должен иметь поля:
-          - speaker: имя спикера (например, "Спикер 1", "Спикер 2")
-          - text: текст фразы
-          - timestamp: временная метка в формате [MM:SS-MM:SS]
-          
-          Пример: [{"speaker": "Спикер 1", "text": "Привет", "timestamp": "[00:00-00:02]"}]`,
-              },
-            ],
-          },
-        ],
-      });
+      const transcriptionData = Array.isArray(result.segments)
+        ? result.segments.map((segment) => ({
+            speaker: segment.speaker,
+            text: segment.text.trim(),
+            timestamp: `[${formatTimestamp(segment.start)}-${formatTimestamp(segment.end)}]`,
+          }))
+        : [];
 
-      const transcriptionData = safeParseJSON(result.text);
-      res.json(Array.isArray(transcriptionData) ? transcriptionData : []);
+      res.json(transcriptionData);
     } catch (error: any) {
       console.error("Transcription error:", error);
       res.status(500).json({ error: error.message });
@@ -143,73 +152,49 @@ async function startServer() {
       const { transcriptionText, weights, factsOnly } = req.body;
 
       if (factsOnly) {
-        // Extract facts using Gemini 1.5 Pro
-        const result = await getGenAI().models.generateContent({
-          model: "gemini-1.5-pro",
-          contents: [
-            {
-              parts: [
-                {
-                  text: `На основе следующей транскрипции звонка выдели ключевые факты по блокам и составь общую сводку. Верни результат СТРОГО в формате JSON со следующими ключами. 
-            ВАЖНО: Значения всех ключей должны быть строками (string).
-            
-            Ключи:
-            - introduction
-            - needDiscovery
-            - presentation
-            - objectionHandling
-            - stopWords
-            - closing
-            - summary
- 
-            Транскрипция:
-            ${transcriptionText}`,
-                },
-              ],
-            },
-          ],
-        });
-        return res.json(safeParseJSON(result.text));
+        const facts = await generateJsonResponse(`На основе следующей транскрипции звонка выдели ключевые факты по блокам и составь общую сводку. Верни результат СТРОГО в формате JSON со следующими ключами.
+ВАЖНО: Значения всех ключей должны быть строками (string).
+
+Ключи:
+- introduction
+- needDiscovery
+- presentation
+- objectionHandling
+- stopWords
+- closing
+- summary
+
+Транскрипция:
+${transcriptionText}`);
+        return res.json(facts);
       }
 
-      // Scoring using Gemini 1.5 Pro
-      const result = await getGenAI().models.generateContent({
-        model: "gemini-1.5-pro",
-        contents: [
-          {
-            parts: [
-              {
-                text: `Оцени качество звонка на основе выделенных фактов и верни результат СТРОГО в формате JSON. Поставь оценку от 1 до 10 для каждого блока. 
-      
-        ВАЖНО: При расчете среднего балла используй следующие веса (в процентах):
-        - Вступление: ${weights.introduction}%
-        - Потребности: ${weights.needDiscovery}%
-        - Презентация: ${weights.presentation}%
-        - Возражения: ${weights.objectionHandling}%
-        - Стоп-слова: ${weights.stopWords}%
-        - Завершение: ${weights.closing}%
-        
-        Итоговый средний балл должен быть взвешенным на основе этих процентов. Также добавь краткий фидбек.
- 
-        Верни JSON со следующими ключами:
-        - introduction (number)
-        - needDiscovery (number)
-        - presentation (number)
-        - objectionHandling (number)
-        - stopWords (number)
-        - closing (number)
-        - average (number)
-        - feedback (string)
+      const scoring = await generateJsonResponse(`Оцени качество звонка на основе выделенных фактов и верни результат СТРОГО в формате JSON. Поставь оценку от 1 до 10 для каждого блока.
 
-        Факты:
-        ${transcriptionText}`,
-              },
-            ],
-          },
-        ],
-      });
+ВАЖНО: При расчете среднего балла используй следующие веса (в процентах):
+- Вступление: ${weights.introduction}%
+- Потребности: ${weights.needDiscovery}%
+- Презентация: ${weights.presentation}%
+- Возражения: ${weights.objectionHandling}%
+- Стоп-слова: ${weights.stopWords}%
+- Завершение: ${weights.closing}%
 
-      res.json(safeParseJSON(result.text));
+Итоговый средний балл должен быть взвешенным на основе этих процентов. Также добавь краткий фидбек.
+
+Верни JSON со следующими ключами:
+- introduction (number)
+- needDiscovery (number)
+- presentation (number)
+- objectionHandling (number)
+- stopWords (number)
+- closing (number)
+- average (number)
+- feedback (string)
+
+Факты:
+${transcriptionText}`);
+
+      res.json(scoring);
     } catch (error: any) {
       console.error("Analysis error:", error);
       res.status(500).json({ error: error.message });
