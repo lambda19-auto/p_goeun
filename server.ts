@@ -1,4 +1,5 @@
 import express from "express";
+import { spawn } from "child_process";
 import { createServer as createViteServer } from "vite";
 import path from "path";
 import multer from "multer";
@@ -12,6 +13,8 @@ import os from "os";
 import { v4 as uuidv4 } from "uuid";
 
 dotenv.config();
+
+const ffmpegBinaryPath = ffmpegStatic || "ffmpeg";
 
 if (ffmpegStatic) {
   ffmpeg.setFfmpegPath(ffmpegStatic);
@@ -73,24 +76,59 @@ function runFfmpeg(command: ffmpeg.FfmpegCommand, outputPath: string): Promise<v
 
 function getAudioDurationInSeconds(filePath: string): Promise<number> {
   return new Promise<number>((resolve, reject) => {
-    ffmpeg.ffprobe(filePath, (err, metadata) => {
-      if (err) {
+    const probe = spawn(ffmpegBinaryPath, ["-hide_banner", "-i", filePath]);
+    let stderr = "";
+    let settled = false;
+
+    probe.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+
+    probe.on("error", (err) => {
+      if (!settled) {
+        settled = true;
         reject(err);
+      }
+    });
+
+    probe.on("close", () => {
+      if (settled) {
         return;
       }
 
-      const duration = metadata.format?.duration;
-      if (typeof duration !== "number" || !Number.isFinite(duration) || duration <= 0) {
+      const match = stderr.match(/Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/);
+      if (!match) {
+        settled = true;
         reject(new Error("Unable to determine audio duration for transcription chunking."));
         return;
       }
 
+      const [, hours, minutes, seconds] = match;
+      const duration = Number(hours) * 3600 + Number(minutes) * 60 + Number(seconds);
+      if (!Number.isFinite(duration) || duration <= 0) {
+        settled = true;
+        reject(new Error("Unable to determine audio duration for transcription chunking."));
+        return;
+      }
+
+      settled = true;
       resolve(duration);
     });
   });
 }
 
-async function transcribeDiarizedFile(filePath: string, offsetSeconds = 0) {
+type TranscriptionSegment = {
+  speaker: string;
+  text: string;
+  timestamp: string;
+  speakerReliable: boolean;
+};
+
+async function transcribeDiarizedFile(
+  filePath: string,
+  options: { offsetSeconds?: number; chunkIndex?: number; speakerReliable?: boolean } = {},
+): Promise<TranscriptionSegment[]> {
+  const { offsetSeconds = 0, chunkIndex = 0, speakerReliable = true } = options;
   const result = (await getOpenAI().audio.transcriptions.create({
     file: fs.createReadStream(filePath),
     model: OPENAI_TRANSCRIPTION_MODEL,
@@ -100,11 +138,16 @@ async function transcribeDiarizedFile(filePath: string, offsetSeconds = 0) {
   })) as TranscriptionDiarized;
 
   return Array.isArray(result.segments)
-    ? result.segments.map((segment) => ({
-        speaker: segment.speaker,
-        text: segment.text.trim(),
-        timestamp: `[${formatTimestamp(segment.start + offsetSeconds)}-${formatTimestamp(segment.end + offsetSeconds)}]`,
-      }))
+    ? result.segments
+        .map((segment) => ({
+          speaker: speakerReliable
+            ? segment.speaker
+            : `Chunk ${chunkIndex + 1} · ${segment.speaker || "Speaker"}`,
+          text: segment.text.trim(),
+          timestamp: `[${formatTimestamp(segment.start + offsetSeconds)}-${formatTimestamp(segment.end + offsetSeconds)}]`,
+          speakerReliable,
+        }))
+        .filter((segment) => segment.text.length > 0)
     : [];
 }
 
@@ -221,12 +264,14 @@ async function startServer() {
 
       // Transcription using OpenAI diarized transcription
       console.log(`Transcribing using ${OPENAI_TRANSCRIPTION_MODEL} (Russian)...`);
-      const transcriptionData = [];
-      for (const transcriptionFile of transcriptionFiles) {
-        const chunkSegments = await transcribeDiarizedFile(
-          transcriptionFile.path,
-          transcriptionFile.offsetSeconds,
-        );
+      const transcriptionData: TranscriptionSegment[] = [];
+      const speakerReliable = transcriptionFiles.length === 1;
+      for (const [chunkIndex, transcriptionFile] of transcriptionFiles.entries()) {
+        const chunkSegments = await transcribeDiarizedFile(transcriptionFile.path, {
+          offsetSeconds: transcriptionFile.offsetSeconds,
+          chunkIndex,
+          speakerReliable,
+        });
         transcriptionData.push(...chunkSegments);
       }
 

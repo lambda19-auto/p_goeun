@@ -111,7 +111,9 @@ export const Auditor: React.FC<AuditorProps> = ({ templates }) => {
       setTranscription(transcriptionData);
 
       setStep('extracting');
-      const transcriptionText = transcriptionData.map((t: any) => `${t.speaker}: ${t.text}`).join('\n');
+      const transcriptionText = transcriptionData
+        .map((t: any) => (t.speakerReliable === false ? t.text : `${t.speaker}: ${t.text}`))
+        .join('\n');
       
       const factsResponse = await fetch('/api/analyze', {
         method: 'POST',
@@ -333,10 +335,16 @@ export const Auditor: React.FC<AuditorProps> = ({ templates }) => {
 
             <div className="lg:col-span-8 space-y-8">
               <div className="bg-zinc-900 rounded-3xl border border-zinc-800 shadow-2xl overflow-hidden flex flex-col h-[700px]">
-                <div className="flex border-b border-zinc-800 bg-zinc-950/50 px-8 py-5">
+                <div className="border-b border-zinc-800 bg-zinc-950/50 px-8 py-5 space-y-3">
                   <h3 className="text-xs font-black uppercase tracking-widest text-indigo-400">
                     Full Transcription
                   </h3>
+                  {transcription.some((turn) => turn.speakerReliable === false) && (
+                    <p className="text-xs leading-relaxed text-amber-300">
+                      Для длинных записей транскрипция разбивается на фрагменты, поэтому метки спикеров
+                      показываются только внутри каждого фрагмента и не используются при оценке звонка.
+                    </p>
+                  )}
                 </div>
                 <div className="flex-1 overflow-y-auto p-8 space-y-8 scrollbar-thin scrollbar-thumb-zinc-800 hover:scrollbar-thumb-zinc-700 transition-colors">
                   {transcription.map((turn, i) => (
