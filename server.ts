@@ -23,6 +23,10 @@ const PORT = 3000;
 const upload = multer({ storage: multer.memoryStorage() });
 
 const ANALYSIS_MODEL = "gpt-5.1-2025-11-13";
+const OPENAI_TRANSCRIPTION_MODEL = "gpt-4o-transcribe-diarize";
+const MAX_TRANSCRIPTION_FILE_BYTES = 25 * 1024 * 1024;
+const TARGET_TRANSCRIPTION_CHUNK_BYTES = 24 * 1024 * 1024;
+const MAX_TRANSCRIPTION_CHUNKS = 16;
 
 // Initialize OpenAI lazily to ensure environment variables are loaded
 let openAIInstance: OpenAI | null = null;
@@ -56,6 +60,100 @@ function formatTimestamp(seconds: number): string {
   const minutes = String(Math.floor(totalSeconds / 60)).padStart(2, "0");
   const remainingSeconds = String(totalSeconds % 60).padStart(2, "0");
   return `${minutes}:${remainingSeconds}`;
+}
+
+function runFfmpeg(command: ffmpeg.FfmpegCommand, outputPath: string): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    command
+      .on("end", () => resolve())
+      .on("error", (err) => reject(err))
+      .save(outputPath);
+  });
+}
+
+function getAudioDurationInSeconds(filePath: string): Promise<number> {
+  return new Promise<number>((resolve, reject) => {
+    ffmpeg.ffprobe(filePath, (err, metadata) => {
+      if (err) {
+        reject(err);
+        return;
+      }
+
+      const duration = metadata.format?.duration;
+      if (typeof duration !== "number" || !Number.isFinite(duration) || duration <= 0) {
+        reject(new Error("Unable to determine audio duration for transcription chunking."));
+        return;
+      }
+
+      resolve(duration);
+    });
+  });
+}
+
+async function transcribeDiarizedFile(filePath: string, offsetSeconds = 0) {
+  const result = (await getOpenAI().audio.transcriptions.create({
+    file: fs.createReadStream(filePath),
+    model: OPENAI_TRANSCRIPTION_MODEL,
+    language: "ru",
+    response_format: "diarized_json",
+    chunking_strategy: "auto",
+  })) as TranscriptionDiarized;
+
+  return Array.isArray(result.segments)
+    ? result.segments.map((segment) => ({
+        speaker: segment.speaker,
+        text: segment.text.trim(),
+        timestamp: `[${formatTimestamp(segment.start + offsetSeconds)}-${formatTimestamp(segment.end + offsetSeconds)}]`,
+      }))
+    : [];
+}
+
+async function splitAudioForTranscription(filePath: string, tempId: string) {
+  const fileSize = fs.statSync(filePath).size;
+  if (fileSize <= MAX_TRANSCRIPTION_FILE_BYTES) {
+    return [{ path: filePath, offsetSeconds: 0, cleanup: false }];
+  }
+
+  const durationSeconds = await getAudioDurationInSeconds(filePath);
+  const chunkCount = Math.ceil(fileSize / TARGET_TRANSCRIPTION_CHUNK_BYTES);
+
+  if (chunkCount > MAX_TRANSCRIPTION_CHUNKS) {
+    throw new Error(
+      `Converted audio is ${Math.ceil(fileSize / (1024 * 1024))} MB and would require ${chunkCount} transcription chunks. Please upload a shorter recording.`,
+    );
+  }
+
+  const chunkDurationSeconds = Math.max(1, Math.ceil(durationSeconds / chunkCount));
+  const chunkDir = fs.mkdtempSync(path.join(os.tmpdir(), `${tempId}_chunks_`));
+  const chunks: Array<{ path: string; offsetSeconds: number; cleanup: boolean }> = [];
+
+  for (let index = 0; index < chunkCount; index += 1) {
+    const offsetSeconds = index * chunkDurationSeconds;
+    const remainingSeconds = durationSeconds - offsetSeconds;
+    if (remainingSeconds <= 0) {
+      break;
+    }
+
+    const chunkPath = path.join(chunkDir, `chunk_${index}.mp3`);
+    await runFfmpeg(
+      ffmpeg(filePath)
+        .setStartTime(offsetSeconds)
+        .duration(Math.min(chunkDurationSeconds, remainingSeconds))
+        .outputOptions("-c copy"),
+      chunkPath,
+    );
+
+    const chunkSize = fs.statSync(chunkPath).size;
+    if (chunkSize > MAX_TRANSCRIPTION_FILE_BYTES) {
+      throw new Error(
+        `A transcription chunk is still ${Math.ceil(chunkSize / (1024 * 1024))} MB after splitting. Please upload a shorter recording.`,
+      );
+    }
+
+    chunks.push({ path: chunkPath, offsetSeconds, cleanup: true });
+  }
+
+  return chunks;
 }
 
 // Helper to safely parse LLM JSON responses
@@ -93,6 +191,8 @@ async function startServer() {
   app.post("/api/transcribe", upload.single("file"), async (req, res) => {
     let inputPath = "";
     let outputPath = "";
+    const cleanupPaths: string[] = [];
+    const cleanupDirs: string[] = [];
     try {
       if (!req.file) {
         return res.status(400).json({ error: "No file uploaded" });
@@ -109,38 +209,43 @@ async function startServer() {
 
       // Convert to mp3 using ffmpeg to ensure compatibility and reduce size
       console.log(`Converting ${originalMimetype} to mp3...`);
-      await new Promise<void>((resolve, reject) => {
-        ffmpeg(inputPath)
-          .toFormat("mp3")
-          .on("end", () => resolve())
-          .on("error", (err) => reject(err))
-          .save(outputPath);
-      });
+      await runFfmpeg(ffmpeg(inputPath).toFormat("mp3"), outputPath);
+
+      const transcriptionFiles = await splitAudioForTranscription(outputPath, tempId);
+      for (const transcriptionFile of transcriptionFiles) {
+        if (transcriptionFile.cleanup) {
+          cleanupPaths.push(transcriptionFile.path);
+          cleanupDirs.push(path.dirname(transcriptionFile.path));
+        }
+      }
 
       // Transcription using OpenAI diarized transcription
-      console.log(`Transcribing using gpt-4o-transcribe-diarize (Russian)...`);
-      const result = (await getOpenAI().audio.transcriptions.create({
-        file: fs.createReadStream(outputPath),
-        model: "gpt-4o-transcribe-diarize",
-        language: "ru",
-        response_format: "diarized_json",
-        chunking_strategy: "auto",
-      })) as TranscriptionDiarized;
-
-      const transcriptionData = Array.isArray(result.segments)
-        ? result.segments.map((segment) => ({
-            speaker: segment.speaker,
-            text: segment.text.trim(),
-            timestamp: `[${formatTimestamp(segment.start)}-${formatTimestamp(segment.end)}]`,
-          }))
-        : [];
+      console.log(`Transcribing using ${OPENAI_TRANSCRIPTION_MODEL} (Russian)...`);
+      const transcriptionData = [];
+      for (const transcriptionFile of transcriptionFiles) {
+        const chunkSegments = await transcribeDiarizedFile(
+          transcriptionFile.path,
+          transcriptionFile.offsetSeconds,
+        );
+        transcriptionData.push(...chunkSegments);
+      }
 
       res.json(transcriptionData);
     } catch (error: any) {
       console.error("Transcription error:", error);
-      res.status(500).json({ error: error.message });
+      const statusCode =
+        typeof error?.message === "string" && error.message.includes("Please upload a shorter recording")
+          ? 413
+          : 500;
+      res.status(statusCode).json({ error: error.message });
     } finally {
       // Cleanup temp files
+      for (const cleanupPath of cleanupPaths) {
+        if (fs.existsSync(cleanupPath)) fs.unlinkSync(cleanupPath);
+      }
+      for (const cleanupDir of new Set(cleanupDirs)) {
+        if (fs.existsSync(cleanupDir)) fs.rmSync(cleanupDir, { recursive: true, force: true });
+      }
       if (inputPath && fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
       if (outputPath && fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
     }
