@@ -132,12 +132,12 @@ export const Auditor: React.FC<AuditorProps> = ({ templates }) => {
       setTranscription(transcriptionData);
 
       setStep('extracting');
-      const transcriptionText = buildAnalysisTranscript(transcriptionData);
+      const analysisTranscript = buildAnalysisTranscript(transcriptionData);
 
       const factsResponse = await fetch('/api/analyze', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ transcriptionText, factsOnly: true }),
+        body: JSON.stringify({ transcriptionText: analysisTranscript, factsOnly: true }),
       });
 
       const factsData = await safeFetchJSON(factsResponse, 'Fact extraction failed');
@@ -151,7 +151,8 @@ export const Auditor: React.FC<AuditorProps> = ({ templates }) => {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ 
-          transcriptionText: JSON.stringify(factsData), 
+          transcriptionText: analysisTranscript,
+          facts: factsData,
           weights,
           factsOnly: false 
         }),
