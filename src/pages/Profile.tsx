@@ -1,14 +1,23 @@
 import React from 'react';
 import { motion } from 'motion/react';
-import { 
-  User, 
-  CreditCard, 
-  Settings, 
-  ChevronRight, 
-  LogOut 
+import {
+  User,
+  CreditCard,
+  Settings,
+  ChevronRight,
+  LogOut
 } from 'lucide-react';
+import { ProfileData } from '../types';
 
-export const Profile: React.FC = () => {
+interface ProfileProps {
+  profile: ProfileData | null;
+}
+
+const formatHours = (seconds: number) => `${(seconds / 3600).toFixed(1)} ч`;
+
+export const Profile: React.FC<ProfileProps> = ({ profile }) => {
+  const subscription = profile?.subscription;
+
   return (
     <motion.div
       initial={{ opacity: 0, x: 20 }}
@@ -17,18 +26,19 @@ export const Profile: React.FC = () => {
       className="p-8 max-w-3xl mx-auto space-y-8"
     >
       <h2 className="text-3xl font-black mb-8">Профиль</h2>
-      
+
       <div className="bg-zinc-900 rounded-3xl border border-zinc-800 overflow-hidden">
         <div className="p-8 flex items-center gap-6 border-b border-zinc-800">
           <div className="w-20 h-20 bg-zinc-800 rounded-full flex items-center justify-center text-zinc-500 border-2 border-zinc-700">
             <User size={40} />
           </div>
           <div>
-            <h3 className="text-xl font-bold">Константин Константинопольский</h3>
-            <p className="text-zinc-500">lidofgen@gmail.com</p>
+            <h3 className="text-xl font-bold">{profile?.fullName || 'Пользователь'}</h3>
+            <p className="text-zinc-500">{profile?.email || 'Нет email'}</p>
+            <p className="text-xs text-zinc-600 mt-1">Роль: {profile?.role || '—'}</p>
           </div>
         </div>
-        
+
         <div className="p-8 space-y-6">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-4">
@@ -36,8 +46,15 @@ export const Profile: React.FC = () => {
                 <CreditCard size={20} />
               </div>
               <div>
-                <p className="font-bold">Подписка: Pro</p>
-                <p className="text-xs text-zinc-500">Следующее списание: 28 Марта 2026</p>
+                <p className="font-bold">Подписка: {subscription?.planName || 'Нет активной подписки'}</p>
+                <p className="text-xs text-zinc-500">
+                  Следующее списание: {subscription?.nextBillingAt ? new Date(subscription.nextBillingAt).toLocaleDateString('ru-RU') : '—'}
+                </p>
+                {subscription && (
+                  <p className="text-xs text-zinc-500 mt-1">
+                    Использовано {formatHours(subscription.secondsUsed)} из {formatHours(subscription.secondsLimit)}
+                  </p>
+                )}
               </div>
             </div>
             <button className="px-4 py-2 bg-zinc-800 hover:bg-zinc-700 rounded-xl text-sm font-bold transition-colors">Управлять</button>
