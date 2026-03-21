@@ -23,4 +23,5 @@ export interface TranscriptionTurn {
   speaker: string;
   text: string;
   timestamp?: string;
+  speakerReliable?: boolean;
 }

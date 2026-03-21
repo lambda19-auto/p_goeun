@@ -32,6 +32,27 @@ interface AuditorProps {
   templates: Template[];
 }
 
+const buildAnalysisTranscript = (turns: TranscriptionTurn[]): string => {
+  const hasChunkLocalSpeakers = turns.some((turn) => turn.speakerReliable === false);
+  const transcriptBody = turns
+    .map((turn) => {
+      const speakerLabel = turn.speaker?.trim() || 'Speaker';
+      const timestampPrefix = turn.timestamp ? `${turn.timestamp} ` : '';
+      return `${timestampPrefix}${speakerLabel}: ${turn.text}`;
+    })
+    .join('\n');
+
+  if (!hasChunkLocalSpeakers) {
+    return transcriptBody;
+  }
+
+  return [
+    'ВНИМАНИЕ: запись была разбита на фрагменты из-за размера файла.',
+    'Метки спикеров внутри одного фрагмента помогают различать собеседников, но не должны считаться глобально стабильными между разными фрагментами.',
+    transcriptBody,
+  ].join('\n\n');
+};
+
 export const Auditor: React.FC<AuditorProps> = ({ templates }) => {
   const [file, setFile] = useState<File | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
@@ -111,12 +132,12 @@ export const Auditor: React.FC<AuditorProps> = ({ templates }) => {
       setTranscription(transcriptionData);
 
       setStep('extracting');
-      const transcriptionText = transcriptionData.map((t: any) => `${t.speaker}: ${t.text}`).join('\n');
-      
+      const analysisTranscript = buildAnalysisTranscript(transcriptionData);
+
       const factsResponse = await fetch('/api/analyze', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ transcriptionText, factsOnly: true }),
+        body: JSON.stringify({ transcriptionText: analysisTranscript, factsOnly: true }),
       });
 
       const factsData = await safeFetchJSON(factsResponse, 'Fact extraction failed');
@@ -130,7 +151,8 @@ export const Auditor: React.FC<AuditorProps> = ({ templates }) => {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ 
-          transcriptionText: JSON.stringify(factsData), 
+          transcriptionText: analysisTranscript,
+          facts: factsData,
           weights,
           factsOnly: false 
         }),
@@ -333,10 +355,17 @@ export const Auditor: React.FC<AuditorProps> = ({ templates }) => {
 
             <div className="lg:col-span-8 space-y-8">
               <div className="bg-zinc-900 rounded-3xl border border-zinc-800 shadow-2xl overflow-hidden flex flex-col h-[700px]">
-                <div className="flex border-b border-zinc-800 bg-zinc-950/50 px-8 py-5">
+                <div className="border-b border-zinc-800 bg-zinc-950/50 px-8 py-5 space-y-3">
                   <h3 className="text-xs font-black uppercase tracking-widest text-indigo-400">
                     Full Transcription
                   </h3>
+                  {transcription.some((turn) => turn.speakerReliable === false) && (
+                    <p className="text-xs leading-relaxed text-amber-300">
+                      Для длинных записей транскрипция разбивается на фрагменты, поэтому метки спикеров
+                      помогают различать собеседников только внутри каждого фрагмента. При оценке они
+                      сохраняются в анализе, но не считаются глобально стабильными между фрагментами.
+                    </p>
+                  )}
                 </div>
                 <div className="flex-1 overflow-y-auto p-8 space-y-8 scrollbar-thin scrollbar-thumb-zinc-800 hover:scrollbar-thumb-zinc-700 transition-colors">
                   {transcription.map((turn, i) => (
