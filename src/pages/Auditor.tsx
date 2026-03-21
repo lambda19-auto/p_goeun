@@ -32,6 +32,27 @@ interface AuditorProps {
   templates: Template[];
 }
 
+const buildAnalysisTranscript = (turns: TranscriptionTurn[]): string => {
+  const hasChunkLocalSpeakers = turns.some((turn) => turn.speakerReliable === false);
+  const transcriptBody = turns
+    .map((turn) => {
+      const speakerLabel = turn.speaker?.trim() || 'Speaker';
+      const timestampPrefix = turn.timestamp ? `${turn.timestamp} ` : '';
+      return `${timestampPrefix}${speakerLabel}: ${turn.text}`;
+    })
+    .join('\n');
+
+  if (!hasChunkLocalSpeakers) {
+    return transcriptBody;
+  }
+
+  return [
+    'ВНИМАНИЕ: запись была разбита на фрагменты из-за размера файла.',
+    'Метки спикеров внутри одного фрагмента помогают различать собеседников, но не должны считаться глобально стабильными между разными фрагментами.',
+    transcriptBody,
+  ].join('\n\n');
+};
+
 export const Auditor: React.FC<AuditorProps> = ({ templates }) => {
   const [file, setFile] = useState<File | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
@@ -111,10 +132,8 @@ export const Auditor: React.FC<AuditorProps> = ({ templates }) => {
       setTranscription(transcriptionData);
 
       setStep('extracting');
-      const transcriptionText = transcriptionData
-        .map((t: any) => (t.speakerReliable === false ? t.text : `${t.speaker}: ${t.text}`))
-        .join('\n');
-      
+      const transcriptionText = buildAnalysisTranscript(transcriptionData);
+
       const factsResponse = await fetch('/api/analyze', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -342,7 +361,8 @@ export const Auditor: React.FC<AuditorProps> = ({ templates }) => {
                   {transcription.some((turn) => turn.speakerReliable === false) && (
                     <p className="text-xs leading-relaxed text-amber-300">
                       Для длинных записей транскрипция разбивается на фрагменты, поэтому метки спикеров
-                      показываются только внутри каждого фрагмента и не используются при оценке звонка.
+                      помогают различать собеседников только внутри каждого фрагмента. При оценке они
+                      сохраняются в анализе, но не считаются глобально стабильными между фрагментами.
                     </p>
                   )}
                 </div>
