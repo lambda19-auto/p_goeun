@@ -1,15 +1,17 @@
 import fs from "fs";
 import path from "path";
-import Database from "better-sqlite3";
+import { Pool, type QueryResult } from "pg";
+import dotenv from "dotenv";
 
-const dataDir = path.join(process.cwd(), "data");
-const dbPath = path.join(dataDir, "app.sqlite");
+dotenv.config();
 
-fs.mkdirSync(dataDir, { recursive: true });
-
-export const db = new Database(dbPath);
-db.pragma("journal_mode = WAL");
-db.pragma("foreign_keys = ON");
+const pool = new Pool({
+  user: process.env.POSTGRES_USER || "callscore",
+  host: process.env.POSTGRES_HOST || "localhost",
+  database: process.env.POSTGRES_DB || "callscore",
+  password: process.env.POSTGRES_PASSWORD || "callscore_password",
+  port: Number(process.env.POSTGRES_PORT) || 5432,
+});
 
 export type CriterionCode =
   | "introduction"
@@ -122,30 +124,30 @@ function endOfMonthISOString(): string {
   return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth() + 1, 0, 23, 59, 59, 999)).toISOString();
 }
 
-export function initializeDatabase() {
-  db.exec(`
+export async function initializeDatabase() {
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      id SERIAL PRIMARY KEY,
       email TEXT NOT NULL UNIQUE,
       password_hash TEXT NOT NULL,
       full_name TEXT NOT NULL,
       role TEXT NOT NULL DEFAULT 'admin',
-      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
 
     CREATE TABLE IF NOT EXISTS templates (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      id SERIAL PRIMARY KEY,
       title TEXT NOT NULL,
       description TEXT,
-      is_active INTEGER NOT NULL DEFAULT 1,
+      is_active BOOLEAN NOT NULL DEFAULT true,
       created_by_user_id INTEGER NOT NULL,
-      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY (created_by_user_id) REFERENCES users(id) ON DELETE CASCADE
     );
 
     CREATE TABLE IF NOT EXISTS template_weights (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      id SERIAL PRIMARY KEY,
       template_id INTEGER NOT NULL,
       criterion_code TEXT NOT NULL,
       criterion_name TEXT NOT NULL,
@@ -156,7 +158,7 @@ export function initializeDatabase() {
     );
 
     CREATE TABLE IF NOT EXISTS calls (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      id SERIAL PRIMARY KEY,
       template_id INTEGER NOT NULL,
       template_title_snapshot TEXT NOT NULL,
       audio_file_name TEXT NOT NULL,
@@ -164,44 +166,44 @@ export function initializeDatabase() {
       audio_size_bytes INTEGER,
       duration_seconds INTEGER NOT NULL DEFAULT 0,
       status TEXT NOT NULL DEFAULT 'completed',
-      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      processed_at TEXT,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      processed_at TIMESTAMP,
       FOREIGN KEY (template_id) REFERENCES templates(id) ON DELETE RESTRICT
     );
 
     CREATE TABLE IF NOT EXISTS call_transcripts (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      id SERIAL PRIMARY KEY,
       call_id INTEGER NOT NULL UNIQUE,
       transcript_text TEXT NOT NULL,
       transcript_json TEXT,
-      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY (call_id) REFERENCES calls(id) ON DELETE CASCADE
     );
 
     CREATE TABLE IF NOT EXISTS call_reviews (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      id SERIAL PRIMARY KEY,
       call_id INTEGER NOT NULL UNIQUE,
       average_score REAL NOT NULL,
       summary TEXT,
       feedback_text TEXT,
       facts_json TEXT,
       scores_json TEXT,
-      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY (call_id) REFERENCES calls(id) ON DELETE CASCADE
     );
 
     CREATE TABLE IF NOT EXISTS subscriptions (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      id SERIAL PRIMARY KEY,
       user_id INTEGER NOT NULL UNIQUE,
       plan_name TEXT NOT NULL,
       status TEXT NOT NULL,
       seconds_limit INTEGER NOT NULL DEFAULT 0,
       seconds_used INTEGER NOT NULL DEFAULT 0,
-      period_start TEXT NOT NULL,
-      period_end TEXT NOT NULL,
-      next_billing_at TEXT,
-      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      period_start TIMESTAMP NOT NULL,
+      period_end TIMESTAMP NOT NULL,
+      next_billing_at TIMESTAMP,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
     );
 
@@ -213,37 +215,44 @@ export function initializeDatabase() {
     CREATE INDEX IF NOT EXISTS idx_subscriptions_user_id ON subscriptions (user_id);
   `);
 
-  seedDatabase();
+  await seedDatabase();
 }
 
-function seedDatabase() {
-  const existingUser = db.prepare("SELECT id FROM users WHERE email = ?").get(DEFAULT_USER_EMAIL) as { id: number } | undefined;
-  let userId = existingUser?.id;
+async function seedDatabase() {
+  const existingUserResult = await pool.query<{ id: number }>(
+    "SELECT id FROM users WHERE email = $1",
+    [DEFAULT_USER_EMAIL]
+  );
+  let userId = existingUserResult.rows[0]?.id;
 
   if (!userId) {
-    const userInsert = db
-      .prepare(
-        `INSERT INTO users (email, password_hash, full_name, role, created_at)
-         VALUES (?, ?, ?, ?, ?)`,
-      )
-      .run(DEFAULT_USER_EMAIL, DEFAULT_PASSWORD_HASH, "Константин Константинопольский", "admin", now());
-    userId = Number(userInsert.lastInsertRowid);
+    const userInsertResult = await pool.query<{ id: number }>(
+      `INSERT INTO users (email, password_hash, full_name, role, created_at)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING id`,
+      [DEFAULT_USER_EMAIL, DEFAULT_PASSWORD_HASH, "Константин Константинопольский", "admin", now()]
+    );
+    userId = userInsertResult.rows[0]?.id;
   }
 
-  const subscriptionExists = db.prepare("SELECT id FROM subscriptions WHERE user_id = ?").get(userId) as { id: number } | undefined;
-  if (!subscriptionExists) {
+  const subscriptionExistsResult = await pool.query<{ id: number }>(
+    "SELECT id FROM subscriptions WHERE user_id = $1",
+    [userId]
+  );
+  if (!subscriptionExistsResult.rows[0]) {
     const createdAt = now();
-    db.prepare(
+    await pool.query(
       `INSERT INTO subscriptions (
         user_id, plan_name, status, seconds_limit, seconds_used, period_start, period_end, next_billing_at, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).run(userId, "Pro", "active", 30 * 60 * 60, 0, startOfMonthISOString(), endOfMonthISOString(), monthAheadISOString(), createdAt, createdAt);
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+      [userId, "Pro", "active", 30 * 60 * 60, 0, startOfMonthISOString(), endOfMonthISOString(), monthAheadISOString(), createdAt, createdAt]
+    );
   }
 
-  const templatesCount = db.prepare("SELECT COUNT(*) as count FROM templates").get() as { count: number };
-  if (templatesCount.count === 0) {
+  const templatesCountResult = await pool.query<{ count: number }>("SELECT COUNT(*) as count FROM templates");
+  if (templatesCountResult.rows[0]?.count === 0) {
     for (const definition of DEFAULT_TEMPLATE_DEFINITIONS) {
-      createTemplate({
+      await createTemplate({
         title: definition.title,
         description: definition.description,
         isActive: definition.isActive ?? true,
@@ -267,102 +276,149 @@ function mapTemplateRow(templateRow: Omit<TemplateRecord, "weights">, weightRows
   };
 }
 
-export function listTemplates(): TemplateRecord[] {
-  const templateRows = db
-    .prepare(
-      `SELECT id, title, description, is_active, created_by_user_id, created_at, updated_at
-       FROM templates
-       ORDER BY updated_at DESC, id DESC`,
-    )
-    .all() as Array<Omit<TemplateRecord, "weights">>;
+export async function listTemplates(): Promise<TemplateRecord[]> {
+  const templateRowsResult = await pool.query<{
+    id: number;
+    title: string;
+    description: string | null;
+    is_active: boolean;
+    created_by_user_id: number;
+    created_at: string;
+    updated_at: string;
+  }>(
+    `SELECT id, title, description, is_active, created_by_user_id, created_at, updated_at
+     FROM templates
+     ORDER BY updated_at DESC, id DESC`
+  );
 
-  const weightsStatement = db.prepare(
+  const weightRowsResult = await pool.query<{ template_id: number; criterion_code: CriterionCode; weight: number }>(
     `SELECT template_id, criterion_code, weight
      FROM template_weights
-     ORDER BY sort_order ASC, id ASC`,
+     ORDER BY sort_order ASC, id ASC`
   );
-  const weightRows = weightsStatement.all() as Array<{ template_id: number; criterion_code: CriterionCode; weight: number }>;
 
-  return templateRows.map((row) => mapTemplateRow(row, weightRows.filter((weightRow) => weightRow.template_id === row.id)));
+  return templateRowsResult.rows.map((row) =>
+    mapTemplateRow(
+      { ...row, is_active: row.is_active ? 1 : 0 },
+      weightRowsResult.rows.filter((weightRow) => weightRow.template_id === row.id)
+    )
+  );
 }
 
-export function createTemplate(input: {
+export async function createTemplate(input: {
   title: string;
   description?: string;
   isActive?: boolean;
   createdByUserId: number;
   weights: TemplateWeightMap;
-}): TemplateRecord {
+}): Promise<TemplateRecord> {
   const timestamp = now();
-  const transaction = db.transaction(() => {
-    const result = db
-      .prepare(
-        `INSERT INTO templates (title, description, is_active, created_by_user_id, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-      )
-      .run(input.title.trim(), input.description?.trim() || null, input.isActive === false ? 0 : 1, input.createdByUserId, timestamp, timestamp);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
 
-    const templateId = Number(result.lastInsertRowid);
-    const insertWeight = db.prepare(
-      `INSERT INTO template_weights (template_id, criterion_code, criterion_name, weight, sort_order)
-       VALUES (?, ?, ?, ?, ?)`,
+    const insertResult = await client.query<{ id: number }>(
+      `INSERT INTO templates (title, description, is_active, created_by_user_id, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       RETURNING id`,
+      [input.title.trim(), input.description?.trim() || null, input.isActive !== false, input.createdByUserId, timestamp, timestamp]
     );
 
-    for (const criterion of CRITERIA) {
-      insertWeight.run(templateId, criterion.code, criterion.name, input.weights[criterion.code] ?? 0, criterion.sortOrder);
+    const templateId = insertResult.rows[0]?.id;
+    if (!templateId) {
+      throw new Error("Failed to create template");
     }
 
-    const row = db.prepare(
+    for (const criterion of CRITERIA) {
+      await client.query(
+        `INSERT INTO template_weights (template_id, criterion_code, criterion_name, weight, sort_order)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [templateId, criterion.code, criterion.name, input.weights[criterion.code] ?? 0, criterion.sortOrder]
+      );
+    }
+
+    const rowResult = await client.query<{
+      id: number;
+      title: string;
+      description: string | null;
+      is_active: boolean;
+      created_by_user_id: number;
+      created_at: string;
+      updated_at: string;
+    }>(
       `SELECT id, title, description, is_active, created_by_user_id, created_at, updated_at
        FROM templates
-       WHERE id = ?`,
-    ).get(templateId) as Omit<TemplateRecord, "weights">;
+       WHERE id = $1`,
+      [templateId]
+    );
+
+    const weightRowsResult = await client.query<{ criterion_code: CriterionCode; weight: number }>(
+      `SELECT criterion_code, weight FROM template_weights WHERE template_id = $1 ORDER BY sort_order ASC`,
+      [templateId]
+    );
+
+    await client.query('COMMIT');
 
     return mapTemplateRow(
-      row,
-      db.prepare(`SELECT criterion_code, weight FROM template_weights WHERE template_id = ? ORDER BY sort_order ASC`).all(templateId) as Array<{
-        criterion_code: CriterionCode;
-        weight: number;
-      }>,
+      { ...rowResult.rows[0]!, is_active: rowResult.rows[0]!.is_active ? 1 : 0 },
+      weightRowsResult.rows
     );
-  });
-
-  return transaction();
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
-export function getDefaultUserId(): number {
-  const user = db.prepare("SELECT id FROM users WHERE email = ?").get(DEFAULT_USER_EMAIL) as { id: number };
-  return user.id;
+export async function getDefaultUserId(): Promise<number> {
+  const result = await pool.query<{ id: number }>(
+    "SELECT id FROM users WHERE email = $1",
+    [DEFAULT_USER_EMAIL]
+  );
+  if (!result.rows[0]) {
+    throw new Error("Default user not found");
+  }
+  return result.rows[0].id;
 }
 
-export function getProfile(userId: number): ProfileData {
-  const user = db
-    .prepare(
-      `SELECT id, email, full_name, role, created_at
-       FROM users
-       WHERE id = ?`,
-    )
-    .get(userId) as { id: number; email: string; full_name: string; role: string; created_at: string };
+export async function getProfile(userId: number): Promise<ProfileData> {
+  const userResult = await pool.query<{
+    id: number;
+    email: string;
+    full_name: string;
+    role: string;
+    created_at: string;
+  }>(
+    `SELECT id, email, full_name, role, created_at
+     FROM users
+     WHERE id = $1`,
+    [userId]
+  );
 
-  const subscription = db
-    .prepare(
-      `SELECT plan_name, status, seconds_limit, seconds_used, period_start, period_end, next_billing_at, created_at, updated_at
-       FROM subscriptions
-       WHERE user_id = ?`,
-    )
-    .get(userId) as
-    | {
-        plan_name: string;
-        status: string;
-        seconds_limit: number;
-        seconds_used: number;
-        period_start: string;
-        period_end: string;
-        next_billing_at: string | null;
-        created_at: string;
-        updated_at: string;
-      }
-    | undefined;
+  const user = userResult.rows[0];
+  if (!user) {
+    throw new Error(`User ${userId} not found`);
+  }
+
+  const subscriptionResult = await pool.query<{
+    plan_name: string;
+    status: string;
+    seconds_limit: number;
+    seconds_used: number;
+    period_start: string;
+    period_end: string;
+    next_billing_at: string | null;
+    created_at: string;
+    updated_at: string;
+  }>(
+    `SELECT plan_name, status, seconds_limit, seconds_used, period_start, period_end, next_billing_at, created_at, updated_at
+     FROM subscriptions
+     WHERE user_id = $1`,
+    [userId]
+  );
+
+  const subscription = subscriptionResult.rows[0];
 
   return {
     id: user.id,
@@ -386,47 +442,48 @@ export function getProfile(userId: number): ProfileData {
   };
 }
 
-export function getDashboardStats(templateId?: number): DashboardStats {
-  const filterClause = templateId ? "WHERE c.template_id = @templateId" : "";
-  const params = templateId ? { templateId } : {};
+export async function getDashboardStats(templateId?: number): Promise<DashboardStats> {
+  const filterClause = templateId ? "WHERE c.template_id = $1" : "";
+  const params = templateId ? [templateId] : [];
 
-  const totals = db
-    .prepare(
-      `SELECT
-         COUNT(c.id) as total_calls,
-         ROUND(COALESCE(AVG(cr.average_score), 0), 1) as average_score,
-         COALESCE(SUM(c.duration_seconds), 0) as total_duration_seconds
-       FROM calls c
-       LEFT JOIN call_reviews cr ON cr.call_id = c.id
-       ${filterClause}`,
-    )
-    .get(params) as { total_calls: number; average_score: number; total_duration_seconds: number };
+  const totalsResult = await pool.query<{ total_calls: number; average_score: number; total_duration_seconds: number }>(
+    `SELECT
+       COUNT(c.id) as total_calls,
+       ROUND(COALESCE(AVG(cr.average_score), 0), 1) as average_score,
+       COALESCE(SUM(c.duration_seconds), 0) as total_duration_seconds
+     FROM calls c
+     LEFT JOIN call_reviews cr ON cr.call_id = c.id
+     ${filterClause}`,
+    params
+  );
 
-  const activeTemplates = db
-    .prepare(`SELECT COUNT(*) as count FROM templates WHERE is_active = 1`)
-    .get() as { count: number };
+  const totals = totalsResult.rows[0] || { total_calls: 0, average_score: 0, total_duration_seconds: 0 };
 
-  const leaderboard = db
-    .prepare(
-      `SELECT
-         c.template_title_snapshot as name,
-         COUNT(c.id) as calls,
-         ROUND(COALESCE(AVG(cr.average_score), 0), 1) as score
-       FROM calls c
-       LEFT JOIN call_reviews cr ON cr.call_id = c.id
-       ${filterClause}
-       GROUP BY c.template_title_snapshot
-       ORDER BY score DESC, calls DESC, name ASC
-       LIMIT 5`,
-    )
-    .all(params) as Array<{ name: string; calls: number; score: number }>;
+  const activeTemplatesResult = await pool.query<{ count: number }>(
+    `SELECT COUNT(*) as count FROM templates WHERE is_active = true`
+  );
+  const activeTemplates = activeTemplatesResult.rows[0]?.count || 0;
+
+  const leaderboardResult = await pool.query<{ name: string; calls: number; score: number }>(
+    `SELECT
+       c.template_title_snapshot as name,
+       COUNT(c.id) as calls,
+       ROUND(COALESCE(AVG(cr.average_score), 0), 1) as score
+     FROM calls c
+     LEFT JOIN call_reviews cr ON cr.call_id = c.id
+     ${filterClause}
+     GROUP BY c.template_title_snapshot
+     ORDER BY score DESC, calls DESC, name ASC
+     LIMIT 5`,
+    params
+  );
 
   return {
     totalCalls: totals.total_calls,
     averageScore: totals.average_score,
     totalDurationSeconds: totals.total_duration_seconds,
-    activeTemplates: activeTemplates.count,
-    leaderboard: leaderboard.map((row, index) => ({
+    activeTemplates,
+    leaderboard: leaderboardResult.rows.map((row, index) => ({
       ...row,
       trend: row.calls > 1 ? `+${Math.min(0.1 * row.calls, 0.9).toFixed(1)}` : "+0.0",
       status: index === 0 ? "Top Performer" : row.score >= 8 ? "Improving" : row.score >= 7 ? "Stable" : "Needs Coaching",
@@ -434,7 +491,7 @@ export function getDashboardStats(templateId?: number): DashboardStats {
   };
 }
 
-export function saveCallAnalysis(input: {
+export async function saveCallAnalysis(input: {
   templateId: number;
   audioFileName: string;
   audioMimeType?: string;
@@ -448,32 +505,36 @@ export function saveCallAnalysis(input: {
   feedbackText?: string;
   factsJson?: unknown;
   scoresJson?: unknown;
-}): { callId: number } {
-  const transaction = db.transaction(() => {
-    const template = db
-      .prepare(`SELECT id, title FROM templates WHERE id = ?`)
-      .get(input.templateId) as { id: number; title: string } | undefined;
+}): Promise<{ callId: number }> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const templateResult = await client.query<{ id: number; title: string }>(
+      `SELECT id, title FROM templates WHERE id = $1`,
+      [input.templateId]
+    );
+    const template = templateResult.rows[0];
 
     if (!template) {
       throw new Error(`Template ${input.templateId} not found.`);
     }
 
     const timestamp = now();
-    const callInsert = db
-      .prepare(
-        `INSERT INTO calls (
-          template_id,
-          template_title_snapshot,
-          audio_file_name,
-          audio_mime_type,
-          audio_size_bytes,
-          duration_seconds,
-          status,
-          created_at,
-          processed_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
+    const callInsertResult = await client.query<{ id: number }>(
+      `INSERT INTO calls (
+        template_id,
+        template_title_snapshot,
+        audio_file_name,
+        audio_mime_type,
+        audio_size_bytes,
+        duration_seconds,
+        status,
+        created_at,
+        processed_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      RETURNING id`,
+      [
         template.id,
         template.title,
         input.audioFileName,
@@ -483,36 +544,49 @@ export function saveCallAnalysis(input: {
         input.status || "completed",
         timestamp,
         timestamp,
-      );
-
-    const callId = Number(callInsert.lastInsertRowid);
-
-    db.prepare(
-      `INSERT INTO call_transcripts (call_id, transcript_text, transcript_json, created_at)
-       VALUES (?, ?, ?, ?)`,
-    ).run(callId, input.transcriptText, JSON.stringify(input.transcriptJson ?? null), timestamp);
-
-    db.prepare(
-      `INSERT INTO call_reviews (call_id, average_score, summary, feedback_text, facts_json, scores_json, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-    ).run(
-      callId,
-      input.averageScore,
-      input.summary || null,
-      input.feedbackText || null,
-      JSON.stringify(input.factsJson ?? null),
-      JSON.stringify(input.scoresJson ?? null),
-      timestamp,
+      ]
     );
 
-    db.prepare(
+    const callId = callInsertResult.rows[0]?.id;
+    if (!callId) {
+      throw new Error("Failed to create call record");
+    }
+
+    await client.query(
+      `INSERT INTO call_transcripts (call_id, transcript_text, transcript_json, created_at)
+       VALUES ($1, $2, $3, $4)`,
+      [callId, input.transcriptText, JSON.stringify(input.transcriptJson ?? null), timestamp]
+    );
+
+    await client.query(
+      `INSERT INTO call_reviews (call_id, average_score, summary, feedback_text, facts_json, scores_json, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [
+        callId,
+        input.averageScore,
+        input.summary || null,
+        input.feedbackText || null,
+        JSON.stringify(input.factsJson ?? null),
+        JSON.stringify(input.scoresJson ?? null),
+        timestamp,
+      ]
+    );
+
+    const defaultUserId = await getDefaultUserId();
+    await client.query(
       `UPDATE subscriptions
-       SET seconds_used = seconds_used + ?, updated_at = ?
-       WHERE user_id = ?`,
-    ).run(Math.max(0, Math.round(input.durationSeconds ?? 0)), timestamp, getDefaultUserId());
+       SET seconds_used = seconds_used + $1, updated_at = $2
+       WHERE user_id = $3`,
+      [Math.max(0, Math.round(input.durationSeconds ?? 0)), timestamp, defaultUserId]
+    );
+
+    await client.query('COMMIT');
 
     return { callId };
-  });
-
-  return transaction();
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
 }

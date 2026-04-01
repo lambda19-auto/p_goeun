@@ -1,0 +1,29 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: callscore-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-callscore}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-callscore_password}
+      POSTGRES_DB: ${POSTGRES_DB:-callscore}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - callscore-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-callscore} -d ${POSTGRES_DB:-callscore}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+networks:
+  callscore-network:
+    driver: bridge
+
+volumes:
+  postgres_data:

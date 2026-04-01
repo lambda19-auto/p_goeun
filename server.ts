@@ -258,7 +258,7 @@ function safeParseJSON(content: string | null | undefined): any {
 }
 
 async function startServer() {
-  initializeDatabase();
+  await initializeDatabase();
 
   app.use(express.json());
 
@@ -267,14 +267,19 @@ async function startServer() {
     res.json({ status: "ok" });
   });
 
-  app.get("/api/bootstrap", (req, res) => {
+  app.get("/api/bootstrap", async (req, res) => {
     try {
-      const userId = getDefaultUserId();
+      const userId = await getDefaultUserId();
       const templateId = typeof req.query.templateId === "string" ? Number(req.query.templateId) : undefined;
+      const [templates, profile, dashboard] = await Promise.all([
+        listTemplates(),
+        getProfile(userId),
+        getDashboardStats(Number.isFinite(templateId) ? templateId : undefined),
+      ]);
       res.json({
-        templates: listTemplates(),
-        profile: getProfile(userId),
-        dashboard: getDashboardStats(Number.isFinite(templateId) ? templateId : undefined),
+        templates,
+        profile,
+        dashboard,
       });
     } catch (error: any) {
       console.error("Bootstrap error:", error);
@@ -282,29 +287,33 @@ async function startServer() {
     }
   });
 
-  app.get("/api/templates", (req, res) => {
+  app.get("/api/templates", async (req, res) => {
     try {
-      res.json(listTemplates());
+      const templates = await listTemplates();
+      res.json(templates);
     } catch (error: any) {
       console.error("Templates list error:", error);
       res.status(500).json({ error: error.message });
     }
   });
 
-  app.post("/api/templates", (req, res) => {
+  app.post("/api/templates", async (req, res) => {
     try {
       const { title, description, isActive, weights } = req.body ?? {};
       if (!title || typeof title !== "string") {
         return res.status(400).json({ error: "Template title is required." });
       }
 
-      const template = createTemplate({
-        title,
-        description: typeof description === "string" ? description : undefined,
-        isActive: typeof isActive === "boolean" ? isActive : true,
-        createdByUserId: getDefaultUserId(),
-        weights: normalizeTemplateWeights(weights ?? {}),
-      });
+      const [userId, template] = await Promise.all([
+        getDefaultUserId(),
+        createTemplate({
+          title,
+          description: typeof description === "string" ? description : undefined,
+          isActive: typeof isActive === "boolean" ? isActive : true,
+          createdByUserId: await getDefaultUserId(),
+          weights: normalizeTemplateWeights(weights ?? {}),
+        }),
+      ]);
 
       res.status(201).json(template);
     } catch (error: any) {
@@ -313,7 +322,7 @@ async function startServer() {
     }
   });
 
-  app.post("/api/calls", (req, res) => {
+  app.post("/api/calls", async (req, res) => {
     try {
       const {
         templateId,
@@ -334,7 +343,7 @@ async function startServer() {
         return res.status(400).json({ error: "Missing required call analysis fields." });
       }
 
-      const result = saveCallAnalysis({
+      const result = await saveCallAnalysis({
         templateId: Number(templateId),
         audioFileName,
         audioMimeType,
