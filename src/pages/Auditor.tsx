@@ -169,7 +169,6 @@ export const Auditor: React.FC<AuditorProps> = ({ templates, reloadData }) => {
           audioSizeBytes: file.size,
           durationSeconds: estimateDurationFromTurns(transcriptionData),
           transcriptText: analysisTranscript,
-          transcriptJson: transcriptionData,
           averageScore: scoresData.average,
           summary: factsData.summary,
           feedbackText: scoresData.feedback,

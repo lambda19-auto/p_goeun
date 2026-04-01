@@ -171,18 +171,10 @@ export async function initializeDatabase() {
       FOREIGN KEY (template_id) REFERENCES templates(id) ON DELETE RESTRICT
     );
 
-    CREATE TABLE IF NOT EXISTS call_transcripts (
-      id SERIAL PRIMARY KEY,
-      call_id INTEGER NOT NULL UNIQUE,
-      transcript_text TEXT NOT NULL,
-      transcript_json TEXT,
-      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY (call_id) REFERENCES calls(id) ON DELETE CASCADE
-    );
-
     CREATE TABLE IF NOT EXISTS call_reviews (
       id SERIAL PRIMARY KEY,
       call_id INTEGER NOT NULL UNIQUE,
+      transcript_text TEXT NOT NULL,
       average_score REAL NOT NULL,
       summary TEXT,
       feedback_text TEXT,
@@ -249,8 +241,8 @@ async function seedDatabase() {
     );
   }
 
-  const templatesCountResult = await pool.query<{ count: number }>("SELECT COUNT(*) as count FROM templates");
-  if (templatesCountResult.rows[0]?.count === 0) {
+  const templatesCountResult = await pool.query<{ count: string }>("SELECT COUNT(*) as count FROM templates");
+  if (Number(templatesCountResult.rows[0]?.count) === 0) {
     for (const definition of DEFAULT_TEMPLATE_DEFINITIONS) {
       await createTemplate({
         title: definition.title,
@@ -446,10 +438,10 @@ export async function getDashboardStats(templateId?: number): Promise<DashboardS
   const filterClause = templateId ? "WHERE c.template_id = $1" : "";
   const params = templateId ? [templateId] : [];
 
-  const totalsResult = await pool.query<{ total_calls: number; average_score: number; total_duration_seconds: number }>(
+  const totalsResult = await pool.query<{ total_calls: string; average_score: number; total_duration_seconds: number }>(
     `SELECT
        COUNT(c.id) as total_calls,
-       ROUND(COALESCE(AVG(cr.average_score), 0), 1) as average_score,
+       ROUND(COALESCE(AVG(cr.average_score)::numeric, 0), 1) as average_score,
        COALESCE(SUM(c.duration_seconds), 0) as total_duration_seconds
      FROM calls c
      LEFT JOIN call_reviews cr ON cr.call_id = c.id
@@ -457,18 +449,22 @@ export async function getDashboardStats(templateId?: number): Promise<DashboardS
     params
   );
 
-  const totals = totalsResult.rows[0] || { total_calls: 0, average_score: 0, total_duration_seconds: 0 };
+  const totals = {
+    total_calls: Number(totalsResult.rows[0]?.total_calls) || 0,
+    average_score: totalsResult.rows[0]?.average_score || 0,
+    total_duration_seconds: totalsResult.rows[0]?.total_duration_seconds || 0,
+  };
 
-  const activeTemplatesResult = await pool.query<{ count: number }>(
+  const activeTemplatesResult = await pool.query<{ count: string }>(
     `SELECT COUNT(*) as count FROM templates WHERE is_active = true`
   );
-  const activeTemplates = activeTemplatesResult.rows[0]?.count || 0;
+  const activeTemplates = Number(activeTemplatesResult.rows[0]?.count) || 0;
 
-  const leaderboardResult = await pool.query<{ name: string; calls: number; score: number }>(
+  const leaderboardResult = await pool.query<{ name: string; calls: string; score: number }>(
     `SELECT
        c.template_title_snapshot as name,
        COUNT(c.id) as calls,
-       ROUND(COALESCE(AVG(cr.average_score), 0), 1) as score
+       ROUND(COALESCE(AVG(cr.average_score)::numeric, 0), 1) as score
      FROM calls c
      LEFT JOIN call_reviews cr ON cr.call_id = c.id
      ${filterClause}
@@ -478,12 +474,18 @@ export async function getDashboardStats(templateId?: number): Promise<DashboardS
     params
   );
 
+  const leaderboard = leaderboardResult.rows.map((row) => ({
+    name: row.name,
+    calls: Number(row.calls) || 0,
+    score: row.score || 0,
+  }));
+
   return {
     totalCalls: totals.total_calls,
     averageScore: totals.average_score,
     totalDurationSeconds: totals.total_duration_seconds,
     activeTemplates,
-    leaderboard: leaderboardResult.rows.map((row, index) => ({
+    leaderboard: leaderboard.map((row, index) => ({
       ...row,
       trend: row.calls > 1 ? `+${Math.min(0.1 * row.calls, 0.9).toFixed(1)}` : "+0.0",
       status: index === 0 ? "Top Performer" : row.score >= 8 ? "Improving" : row.score >= 7 ? "Stable" : "Needs Coaching",
@@ -499,7 +501,6 @@ export async function saveCallAnalysis(input: {
   durationSeconds?: number;
   status?: string;
   transcriptText: string;
-  transcriptJson: unknown;
   averageScore: number;
   summary?: string;
   feedbackText?: string;
@@ -553,16 +554,11 @@ export async function saveCallAnalysis(input: {
     }
 
     await client.query(
-      `INSERT INTO call_transcripts (call_id, transcript_text, transcript_json, created_at)
-       VALUES ($1, $2, $3, $4)`,
-      [callId, input.transcriptText, JSON.stringify(input.transcriptJson ?? null), timestamp]
-    );
-
-    await client.query(
-      `INSERT INTO call_reviews (call_id, average_score, summary, feedback_text, facts_json, scores_json, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      `INSERT INTO call_reviews (call_id, transcript_text, average_score, summary, feedback_text, facts_json, scores_json, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
       [
         callId,
+        input.transcriptText,
         input.averageScore,
         input.summary || null,
         input.feedbackText || null,
