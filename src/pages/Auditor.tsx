@@ -59,6 +59,202 @@ const estimateDurationFromTurns = (turns: TranscriptionTurn[]) => {
   return Number(match[1]) * 60 + Number(match[2]);
 };
 
+
+interface RenderedPdfPage {
+  data: Uint8Array;
+  width: number;
+  height: number;
+}
+
+const PDF_PAGE_WIDTH = 595;
+const PDF_PAGE_HEIGHT = 842;
+
+const createWrappedLines = (ctx: CanvasRenderingContext2D, text: string, maxWidth: number): string[] => {
+  if (!text.trim()) {
+    return [''];
+  }
+
+  const words = text.split(/\s+/);
+  const lines: string[] = [];
+  let currentLine = '';
+
+  for (const word of words) {
+    const candidate = currentLine ? `${currentLine} ${word}` : word;
+    if (ctx.measureText(candidate).width <= maxWidth) {
+      currentLine = candidate;
+      continue;
+    }
+
+    if (currentLine) {
+      lines.push(currentLine);
+      currentLine = word;
+      continue;
+    }
+
+    let chunk = '';
+    for (const char of word) {
+      const nextChunk = `${chunk}${char}`;
+      if (ctx.measureText(nextChunk).width > maxWidth && chunk) {
+        lines.push(chunk);
+        chunk = char;
+      } else {
+        chunk = nextChunk;
+      }
+    }
+    currentLine = chunk;
+  }
+
+  if (currentLine) {
+    lines.push(currentLine);
+  }
+
+  return lines;
+};
+
+const dataUrlToUint8Array = (dataUrl: string): Uint8Array => {
+  const base64 = dataUrl.split(',')[1] || '';
+  const binary = atob(base64);
+  return Uint8Array.from(binary, (char) => char.charCodeAt(0));
+};
+
+const renderReportPages = (reportLines: string[]): RenderedPdfPage[] => {
+  const scale = 2;
+  const pageWidthPx = Math.floor(PDF_PAGE_WIDTH * scale);
+  const pageHeightPx = Math.floor(PDF_PAGE_HEIGHT * scale);
+  const marginPx = 48 * scale;
+  const lineHeight = 18 * scale;
+
+  const canvas = document.createElement('canvas');
+  canvas.width = pageWidthPx;
+  canvas.height = pageHeightPx;
+  const ctx = canvas.getContext('2d');
+
+  if (!ctx) {
+    throw new Error('Не удалось инициализировать canvas для PDF.');
+  }
+
+  const pages: RenderedPdfPage[] = [];
+
+  const resetPage = () => {
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, pageWidthPx, pageHeightPx);
+    ctx.fillStyle = '#111827';
+    ctx.font = `${15 * scale}px Arial, sans-serif`;
+    ctx.textBaseline = 'top';
+  };
+
+  const pushPage = () => {
+    const jpegData = canvas.toDataURL('image/jpeg', 0.9);
+    pages.push({
+      data: dataUrlToUint8Array(jpegData),
+      width: pageWidthPx,
+      height: pageHeightPx,
+    });
+  };
+
+  resetPage();
+  let y = marginPx;
+  const textWidth = pageWidthPx - marginPx * 2;
+
+  for (const line of reportLines) {
+    const wrappedLines = createWrappedLines(ctx, line, textWidth);
+
+    for (const wrappedLine of wrappedLines) {
+      if (y + lineHeight > pageHeightPx - marginPx) {
+        pushPage();
+        resetPage();
+        y = marginPx;
+      }
+      ctx.fillText(wrappedLine, marginPx, y);
+      y += lineHeight;
+    }
+
+    y += Math.floor(lineHeight * 0.35);
+  }
+
+  pushPage();
+  return pages;
+};
+
+const buildPdfFromImages = (pages: RenderedPdfPage[]): Uint8Array => {
+  const encoder = new TextEncoder();
+  const chunks: Uint8Array[] = [];
+  const offsets: number[] = [];
+  let position = 0;
+
+  const append = (chunk: Uint8Array | string) => {
+    const bytes = typeof chunk === 'string' ? encoder.encode(chunk) : chunk;
+    chunks.push(bytes);
+    position += bytes.length;
+  };
+
+  append('%PDF-1.4\n%\u00FF\u00FF\u00FF\u00FF\n');
+
+  const objectCount = 2 + pages.length * 3;
+  const pageObjectIds: number[] = [];
+
+  offsets[1] = position;
+  append('1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n');
+
+  for (let index = 0; index < pages.length; index += 1) {
+    pageObjectIds.push(5 + index * 3);
+  }
+
+  offsets[2] = position;
+  append(
+    `2 0 obj\n<< /Type /Pages /Count ${pages.length} /Kids [${pageObjectIds
+      .map((id) => `${id} 0 R`)
+      .join(' ')}] >>\nendobj\n`
+  );
+
+  pages.forEach((page, index) => {
+    const imageObjectId = 3 + index * 3;
+    const contentObjectId = 4 + index * 3;
+    const pageObjectId = 5 + index * 3;
+
+    offsets[imageObjectId] = position;
+    append(
+      `${imageObjectId} 0 obj\n<< /Type /XObject /Subtype /Image /Width ${page.width} /Height ${page.height} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length ${page.data.length} >>\nstream\n`
+    );
+    append(page.data);
+    append('\nendstream\nendobj\n');
+
+    const content = `q\n${PDF_PAGE_WIDTH} 0 0 ${PDF_PAGE_HEIGHT} 0 0 cm\n/Im${index + 1} Do\nQ`;
+    const contentBytes = encoder.encode(content);
+
+    offsets[contentObjectId] = position;
+    append(`${contentObjectId} 0 obj\n<< /Length ${contentBytes.length} >>\nstream\n`);
+    append(contentBytes);
+    append('\nendstream\nendobj\n');
+
+    offsets[pageObjectId] = position;
+    append(
+      `${pageObjectId} 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${PDF_PAGE_WIDTH} ${PDF_PAGE_HEIGHT}] /Resources << /XObject << /Im${index + 1} ${imageObjectId} 0 R >> >> /Contents ${contentObjectId} 0 R >>\nendobj\n`
+    );
+  });
+
+  const xrefOffset = position;
+  append(`xref\n0 ${objectCount + 1}\n`);
+  append('0000000000 65535 f \n');
+
+  for (let index = 1; index <= objectCount; index += 1) {
+    const offset = offsets[index] || 0;
+    append(`${offset.toString().padStart(10, '0')} 00000 n \n`);
+  }
+
+  append(`trailer\n<< /Size ${objectCount + 1} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF`);
+
+  const fullSize = chunks.reduce((total, chunk) => total + chunk.length, 0);
+  const output = new Uint8Array(fullSize);
+  let cursor = 0;
+  chunks.forEach((chunk) => {
+    output.set(chunk, cursor);
+    cursor += chunk.length;
+  });
+
+  return output;
+};
+
 export const Auditor: React.FC<AuditorProps> = ({ templates, reloadData }) => {
   const [file, setFile] = useState<File | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
@@ -204,19 +400,54 @@ export const Auditor: React.FC<AuditorProps> = ({ templates, reloadData }) => {
   };
 
   const downloadReport = () => {
-    const reportData = {
-      score: scores,
-      facts: facts,
-      transcription: transcription,
-      savedCallId,
-    };
-    const blob = new Blob([JSON.stringify(reportData, null, 2)], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `report_${file?.name || 'call'}.json`;
-    a.click();
-    URL.revokeObjectURL(url);
+    try {
+      const reportLines = [
+        `Отчет по аудиту: ${file?.name || 'call'}`,
+        `Дата: ${new Date().toLocaleString()}`,
+        savedCallId ? `ID звонка: ${savedCallId}` : 'ID звонка: не сохранен',
+        '',
+        'Итоговая оценка',
+        `Средний балл: ${scores?.average?.toFixed(1) || '0.0'} / 10`,
+        `Вступление: ${scores?.introduction ?? '-'} / 10`,
+        `Потребности: ${scores?.needDiscovery ?? '-'} / 10`,
+        `Презентация: ${scores?.presentation ?? '-'} / 10`,
+        `Возражения: ${scores?.objectionHandling ?? '-'} / 10`,
+        `Стоп-слова: ${scores?.stopWords ?? '-'} / 10`,
+        `Завершение: ${scores?.closing ?? '-'} / 10`,
+        '',
+        'Фидбек',
+        scores?.feedback || 'Нет данных',
+        '',
+        'Факты',
+        `Вступление: ${facts?.introduction || 'Нет данных'}`,
+        `Потребности: ${facts?.needDiscovery || 'Нет данных'}`,
+        `Презентация: ${facts?.presentation || 'Нет данных'}`,
+        `Возражения: ${facts?.objectionHandling || 'Нет данных'}`,
+        `Стоп-слова: ${facts?.stopWords || 'Нет данных'}`,
+        `Завершение: ${facts?.closing || 'Нет данных'}`,
+        `Summary: ${facts?.summary || 'Нет данных'}`,
+        '',
+        'Транскрипция',
+        ...transcription.map((turn) => {
+          const timestamp = turn.timestamp ? `${turn.timestamp} ` : '';
+          const speaker = turn.speaker?.trim() || 'Speaker';
+          return `${timestamp}${speaker}: ${turn.text}`;
+        }),
+      ];
+
+      const pages = renderReportPages(reportLines);
+      const pdfBytes = buildPdfFromImages(pages);
+      const blob = new Blob([pdfBytes], { type: 'application/pdf' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `report_${file?.name || 'call'}.pdf`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      console.error('Не удалось сформировать PDF-отчет:', err);
+      setError('Не удалось сформировать PDF-отчет. Попробуйте еще раз.');
+    }
   };
 
   return (
