@@ -87,6 +87,10 @@ const createWrappedLines = (ctx: CanvasRenderingContext2D, text: string, maxWidt
 
     if (currentLine) {
       lines.push(currentLine);
+      currentLine = '';
+    }
+
+    if (ctx.measureText(word).width <= maxWidth) {
       currentLine = word;
       continue;
     }
