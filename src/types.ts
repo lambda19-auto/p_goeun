@@ -36,7 +36,6 @@ export interface FactBlocks {
   objectionHandling: string;
   stopWords: string;
   closing: string;
-  summary: string;
 }
 
 export interface TranscriptionTurn {

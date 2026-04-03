@@ -371,7 +371,6 @@ export const Auditor: React.FC<AuditorProps> = ({ templates, reloadData }) => {
           transcriptText: analysisTranscript,
           transcriptJson: transcriptionData,
           averageScore: scoresData.average,
-          summary: factsData.summary,
           feedbackText: scoresData.feedback,
           factsJson: factsData,
           scoresJson: scoresData,
@@ -429,7 +428,6 @@ export const Auditor: React.FC<AuditorProps> = ({ templates, reloadData }) => {
         `Возражения: ${facts?.objectionHandling || 'Нет данных'}`,
         `Стоп-слова: ${facts?.stopWords || 'Нет данных'}`,
         `Завершение: ${facts?.closing || 'Нет данных'}`,
-        `Summary: ${facts?.summary || 'Нет данных'}`,
         '',
         'Транскрипция',
         ...transcription.map((turn) => {
@@ -604,7 +602,7 @@ export const Auditor: React.FC<AuditorProps> = ({ templates, reloadData }) => {
 
             <div className="lg:col-span-8 space-y-8">
               <div className="bg-zinc-900 rounded-3xl p-8 border border-zinc-800 shadow-xl">
-                <h3 className="font-black text-xs uppercase tracking-[0.2em] text-zinc-500 mb-6">Факты и summary</h3>
+                <h3 className="font-black text-xs uppercase tracking-[0.2em] text-zinc-500 mb-6">Факты</h3>
                 <div className="grid md:grid-cols-2 gap-4">
                   {facts && [
                     { label: 'Вступление', text: facts.introduction },
@@ -613,9 +611,8 @@ export const Auditor: React.FC<AuditorProps> = ({ templates, reloadData }) => {
                     { label: 'Возражения', text: facts.objectionHandling },
                     { label: 'Стоп-слова', text: facts.stopWords },
                     { label: 'Завершение', text: facts.closing },
-                    { label: 'Summary', text: facts.summary, fullWidth: true },
                   ].map((item) => (
-                    <div key={item.label} className={cn('rounded-2xl bg-zinc-950 border border-zinc-800 p-4', item.fullWidth && 'md:col-span-2')}>
+                    <div key={item.label} className="rounded-2xl bg-zinc-950 border border-zinc-800 p-4">
                       <p className="text-[10px] font-black uppercase tracking-[0.2em] text-indigo-400 mb-2">{item.label}</p>
                       <p className="text-sm text-zinc-300 leading-relaxed whitespace-pre-wrap">{item.text || 'Нет данных'}</p>
                     </div>
