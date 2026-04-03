@@ -324,7 +324,6 @@ async function startServer() {
         transcriptText,
         transcriptJson,
         averageScore,
-        summary,
         feedbackText,
         factsJson,
         scoresJson,
@@ -343,7 +342,6 @@ async function startServer() {
         transcriptText,
         transcriptJson,
         averageScore,
-        summary,
         feedbackText,
         factsJson,
         scoresJson,
@@ -429,7 +427,6 @@ async function startServer() {
 - objectionHandling
 - stopWords
 - closing
-- summary
 
 Транскрипция:
 ${transcriptionText}`);

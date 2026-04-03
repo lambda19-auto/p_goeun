@@ -182,7 +182,6 @@ export async function initializeDatabase() {
       id BIGSERIAL PRIMARY KEY,
       call_id BIGINT NOT NULL UNIQUE REFERENCES calls(id) ON DELETE CASCADE,
       average_score REAL NOT NULL,
-      summary TEXT,
       feedback_text TEXT,
       facts_json JSONB,
       scores_json JSONB,
@@ -210,6 +209,7 @@ export async function initializeDatabase() {
     CREATE INDEX IF NOT EXISTS idx_call_reviews_call_id ON call_reviews (call_id);
     CREATE INDEX IF NOT EXISTS idx_subscriptions_user_id ON subscriptions (user_id);
   `);
+
 
   await seedDatabase();
 }
@@ -462,7 +462,6 @@ export async function saveCallAnalysis(input: {
   transcriptText: string;
   transcriptJson: unknown;
   averageScore: number;
-  summary?: string;
   feedbackText?: string;
   factsJson?: unknown;
   scoresJson?: unknown;
@@ -513,12 +512,11 @@ export async function saveCallAnalysis(input: {
     );
 
     await client.query(
-      `INSERT INTO call_reviews (call_id, average_score, summary, feedback_text, facts_json, scores_json, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      `INSERT INTO call_reviews (call_id, average_score, feedback_text, facts_json, scores_json, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
       [
         callId,
         input.averageScore,
-        input.summary || null,
         input.feedbackText || null,
         JSON.stringify(input.factsJson ?? null),
         JSON.stringify(input.scoresJson ?? null),
